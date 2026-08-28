@@ -182,9 +182,11 @@ class _EpubWriter:
     which strict readers require.
     """
 
-    def __init__(self, path: Path, metadata: dict):
+    def __init__(self, path: Path, metadata: dict,
+                 cover: "tuple[str, bytes] | None" = None):
         self.path = Path(path)
         self.metadata = metadata
+        self.cover = cover
         self.image_names: list[str] = []
         self.images: list[bytes] = []
         self.uuid = str(uuid.uuid4())
@@ -241,6 +243,11 @@ class _EpubWriter:
                 for i, name in enumerate(self.image_names, start=1)
             )
         )
+        if self.cover is not None:
+            manifest += (
+                '<item id="cover" media-type="image/png" '
+                'properties="cover-image" href="images/cover.png"/>'
+            )
         spine = "".join(
             f'<itemref idref="{sid}"/>' for sid in self._section_ids
         )
@@ -297,6 +304,8 @@ class _EpubWriter:
                 z.writestr(f"OEBPS/page-{i:04d}.xhtml", self._section_xhtml(i, name))
             for name, data in zip(self.image_names, self.images):
                 z.writestr(f"OEBPS/images/{name}", data)
+            if self.cover is not None:
+                z.writestr("OEBPS/images/cover.png", self.cover[1])
 
         self._tmp.write_bytes(buf.getvalue())
         self._tmp.replace(self.path)
@@ -314,6 +323,7 @@ def format_size(num_bytes: int) -> str:
 
 def convert(input_path: Path, output_path: Path | None = None,
             resolution: int | None = None, crop: str | None = None,
+            cover: bool = True,
             log=None, progress=None) -> Path:
     """Convert *input_path* (a PDF) to an EPUB and return the output path.
 
@@ -323,6 +333,9 @@ def convert(input_path: Path, output_path: Path | None = None,
     render width in pixels. *crop*, when given, trims white margins:
     ``"global"`` uses one common inset for all pages, ``"page"`` trims each
     page to its own content.
+
+    When *cover* is true (the default) the first page also becomes the book's
+    cover image.
 
     *log* (optional callable(str)) receives descriptive lines (input info,
     output result). *progress* (optional callable(done, total)) is called for
@@ -398,8 +411,10 @@ def convert(input_path: Path, output_path: Path | None = None,
 
     pages = rendered
 
+    cover_data = ("cover.png", pages[0][1]) if cover else None
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    writer = _EpubWriter(output_path, metadata)
+    writer = _EpubWriter(output_path, metadata, cover=cover_data)
     for name, data in pages:
         writer.add_image(name, data)
     writer.build()

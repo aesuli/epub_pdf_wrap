@@ -40,6 +40,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--crop-page", action="store_true",
         help="trim white margins per page, to each page's own content",
     )
+    parser.add_argument(
+        "--nocover", action="store_true",
+        help="do not use the first page as the book's cover (default: cover on)",
+    )
     return parser
 
 
@@ -64,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
             args.output,
             args.resolution,
             crop=crop,
+            cover=not args.nocover,
             log=lambda line: print(line),
             progress=_progress,
         )

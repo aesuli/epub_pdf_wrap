@@ -37,6 +37,8 @@ replaced by the `epub` extension. Running without `pip install` also works via
   pages keep the same size).
 - `--crop-page`: trim the white margins around each page's own content, page
   by page (trims more aggressively but page sizes may vary).
+- `--nocover`: skip using the first page as the book's cover image. By
+  default the first page of the PDF is also set as the EPUB cover.
 
 `-c/--crop-global` and `--crop-page` are mutually exclusive; with neither
 flag the margins are left as-is.

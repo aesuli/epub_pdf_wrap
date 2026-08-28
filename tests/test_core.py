@@ -55,6 +55,23 @@ def test_epub_is_readable_by_ebooklib(tmp_path: Path, tiny_pdf: Path) -> None:
         assert item is not None
         assert "<img" in item.get_content().decode("utf-8")
 
+    # Cover: default is the first page's image, flagged in the manifest and
+    # identical to the first page render.
+    import zipfile
+
+    with zipfile.ZipFile(out) as z:
+        assert "OEBPS/images/cover.png" in z.namelist()
+        assert z.read("OEBPS/images/cover.png") == z.read("OEBPS/images/page-0001.png")
+        opf = z.read("OEBPS/content.opf").decode("utf-8")
+        assert (
+            '<item id="cover" media-type="image/png" '
+            'properties="cover-image" href="images/cover.png"/>'
+        ) in opf
+
+    cover_items = list(book.get_items_of_type(ebooklib.ITEM_COVER))
+    assert len(cover_items) == 1
+    assert cover_items[0].get_name() == "images/cover.png"
+
     # Every spine image must be present
     images = {i.get_name() for i in book.get_items_of_type(ebooklib.ITEM_IMAGE)}
     assert images == {"images/page-0001.png", "images/page-0002.png"}
@@ -263,6 +280,27 @@ def test_crop_invalid_value_raises(inset_pdf: Path) -> None:
         convert(inset_pdf, inset_pdf.with_suffix(".epub"), crop="bogus")
 
 
+def test_nocover_flag(tmp_path: Path, tiny_pdf: Path) -> None:
+    import zipfile
+
+    out = convert(tiny_pdf, tmp_path / "nocover.epub", cover=False)
+    with zipfile.ZipFile(out) as z:
+        names = z.namelist()
+        assert "OEBPS/images/cover.png" not in names
+        opf = z.read("OEBPS/content.opf").decode("utf-8")
+        assert 'id="cover"' not in opf
+        assert "cover-image" not in opf
+        assert '<itemref idref="sec-0000"/>' in opf
+
+    # The rest of the book is unchanged apart from the cover image
+    base = convert(tiny_pdf, tmp_path / "base.epub", cover=True)
+    with zipfile.ZipFile(out) as z:
+        without = set(z.namelist())
+    with zipfile.ZipFile(base) as z:
+        with_cover = set(z.namelist())
+    assert with_cover - without == {"OEBPS/images/cover.png"}
+
+
 def test_cli_parser_crop_flags() -> None:
     from epub_pdf_wrap.__main__ import build_parser
 
@@ -276,6 +314,10 @@ def test_cli_parser_crop_flags() -> None:
     with pytest.raises(SystemExit) as exc:
         p.parse_args(["in.pdf", "-c", "--crop-page"])
     assert exc.value.code == 2
+    args = p.parse_args(["in.pdf"])
+    assert args.nocover is False
+    args = p.parse_args(["in.pdf", "--nocover"])
+    assert args.nocover is True
 
 
 @pytest.fixture
