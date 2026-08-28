@@ -26,6 +26,15 @@ def build_parser() -> argparse.ArgumentParser:
         "-r", "--resolution", type=int,
         help="target render width in pixels for the output (default: input resolution)",
     )
+    crop = parser.add_mutually_exclusive_group()
+    crop.add_argument(
+        "-c", "--crop-global", action="store_true",
+        help="trim white margins using one common inset for all pages",
+    )
+    crop.add_argument(
+        "--crop-page", action="store_true",
+        help="trim white margins per page, to each page's own content",
+    )
     return parser
 
 
@@ -43,11 +52,13 @@ def _progress(done: int, total: int) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    crop = "global" if args.crop_global else ("page" if args.crop_page else None)
     try:
         out = convert(
             args.input,
             args.output,
             args.resolution,
+            crop=crop,
             log=lambda line: print(line),
             progress=_progress,
         )

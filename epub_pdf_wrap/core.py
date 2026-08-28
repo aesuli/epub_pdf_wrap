@@ -22,19 +22,106 @@ def slugify(name: str) -> str:
     return slug.strip("-") or "document"
 
 
-def render_page(page: "pymupdf.Page", resolution: int | None = None) -> bytes:
+# An edge inset counts as a real margin only if it is at least this fraction
+# of the page dimension; anything smaller is treated as a sliver
+# (anti-aliasing, registration marks) and the page is left untrimmed.
+_MARGINS_FRACTION = 0.01
+
+
+def content_bbox(page: "pymupdf.Page"):
+    """Union of the bounding boxes of all content on the page, or None if
+    the page is blank.
+
+    ``get_bboxlog`` returns a list of ``(kind, bbox)`` tuples; the union of
+    those boxes is the extent of the page's content.
+    """
+    log = page.get_bboxlog()
+    if not log:
+        return None
+    bbox = pymupdf.Rect(*log[0][1])
+    for _, b in log[1:]:
+        bbox |= pymupdf.Rect(*b)
+    if not bbox.is_valid or bbox.is_empty or bbox.is_infinite:
+        return None
+    return bbox
+
+
+def margin_insets(bbox: "pymupdf.Rect", rect: "pymupdf.Rect") -> tuple[int, int, int, int]:
+    """Return (left, right, top, bottom) booleans flagging real margins.
+
+    An inset counts as a real margin when it is at least
+    ``_MARGINS_FRACTION`` of the corresponding page dimension.
+    """
+    left = rect.x0 < bbox.x0 - _MARGINS_FRACTION * rect.width
+    right = rect.x1 > bbox.x1 + _MARGINS_FRACTION * rect.width
+    top = rect.y0 < bbox.y0 - _MARGINS_FRACTION * rect.height
+    bottom = rect.y1 > bbox.y1 + _MARGINS_FRACTION * rect.height
+    return (1 if left else 0, 1 if right else 0, 1 if top else 0, 1 if bottom else 0)
+
+
+def page_clip_rect(page: "pymupdf.Page"):
+    """Per-page clip: the content bbox clamped to the page, or the page rect
+    if the page is blank or has no real margins on every side."""
+    rect = page.rect
+    bbox = content_bbox(page)
+    if bbox is None or not any(margin_insets(bbox, rect)):
+        return rect
+    clip = bbox & rect  # intersection, clamps the bbox within the page
+    if clip.is_empty:
+        return rect
+    return clip
+
+
+def global_clip_rects(doc: "pymupdf.Document") -> list["pymupdf.Rect"]:
+    """One common clip rect for every page, safe for all of them.
+
+    For a common clip to never cut into any page's content it must fully
+    contain each page's content region; the union of the per-page content
+    boxes is the smallest box with that property, hence the most aggressive
+    safe common trim (and it yields a uniform size for all pages). Blank
+    pages fall back to their own full rect.
+    """
+    per_page = [(doc.load_page(i), content_bbox(doc.load_page(i)))
+                for i in range(doc.page_count)]
+    nonblank = [bbox for _, bbox in per_page if bbox is not None]
+    if not nonblank:
+        return [page.rect for page, _ in per_page]
+
+    common = pymupdf.Rect(
+        min(b.x0 for b in nonblank),
+        min(b.y0 for b in nonblank),
+        max(b.x1 for b in nonblank),
+        max(b.y1 for b in nonblank),
+    )
+    clips = []
+    for page, bbox in per_page:
+        if bbox is None:
+            clips.append(page.rect)
+            continue
+        clip = common & page.rect  # clamp the common box inside this page
+        clips.append(clip if clip.width > 0 and clip.height > 0 else page.rect)
+    return clips
+
+
+def render_page(page: "pymupdf.Page", resolution: int | None = None,
+                clip: "pymupdf.Rect | None" = None) -> bytes:
     """Render one PDF page to a PNG byte string.
 
     *resolution*, when given, is the target width in pixels; the height is
-    scaled proportionally.
+    scaled proportionally. *clip*, when given, is a ``Rect`` in page
+    coordinates to render only that region (e.g. with margins trimmed).
     """
+    rect = clip if clip is not None else page.rect
     if resolution is not None:
         if resolution <= 0:
             raise ConversionError(f"resolution must be positive, got {resolution}")
-        scale = resolution / page.rect.width
+        scale = resolution / rect.width
     else:
         scale = 1.0
-    pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=True, colorspace=pymupdf.csRGB)
+    kwargs = {"alpha": True, "colorspace": pymupdf.csRGB}
+    if clip is not None:
+        kwargs["clip"] = clip
+    pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), **kwargs)
     return pix.tobytes("png")
 
 
@@ -160,18 +247,24 @@ def format_size(num_bytes: int) -> str:
 
 
 def convert(input_path: Path, output_path: Path | None = None,
-            resolution: int | None = None, log=None, progress=None) -> Path:
+            resolution: int | None = None, crop: str | None = None,
+            log=None, progress=None) -> Path:
     """Convert *input_path* (a PDF) to an EPUB and return the output path.
 
     Every PDF page is rendered to a PNG and placed in its own EPUB section in
     document order. The output file defaults to the input name with the
     extension swapped to ``.epub``. *resolution*, when given, is the target
-    render width in pixels.
+    render width in pixels. *crop*, when given, trims white margins:
+    ``"global"`` uses one common inset for all pages, ``"page"`` trims each
+    page to its own content.
 
     *log* (optional callable(str)) receives descriptive lines (input info,
     output result). *progress* (optional callable(done, total)) is called for
     every rendered page.
     """
+    if crop is not None and crop not in ("global", "page"):
+        raise ConversionError(f"crop must be 'global' or 'page', got {crop!r}")
+
     def _log(message: str) -> None:
         if log is not None:
             log(message)
@@ -202,28 +295,41 @@ def convert(input_path: Path, output_path: Path | None = None,
         if page_count == 0:
             raise ConversionError(f"PDF has no pages: {input_path}")
         title = doc.metadata.get("title") or slugify(input_path.stem)
+        pages_list = [doc.load_page(i) for i in range(page_count)]
 
-        first = doc.load_page(0)
+        first = pages_list[0]
         w, h = first.rect.width, first.rect.height
         uniform = all(
-            doc.load_page(i).rect.width == w and doc.load_page(i).rect.height == h
-            for i in range(1, page_count)
+            p.rect.width == w and p.rect.height == h for p in pages_list[1:]
         )
         native = f"{w:.0f} x {h:.0f} px" + ("" if uniform else " (varies)")
+        _log(f"pages:   {page_count}  (native resolution: {native})")
+        if crop == "global":
+            clips = global_clip_rects(doc)
+        elif crop == "page":
+            clips = [page_clip_rect(p) for p in pages_list]
+        else:
+            clips = [None] * page_count
         if resolution is not None:
-            _log(f"pages:   {page_count}  (native resolution: {native})")
             _log(f"output:  {output_path}  ({resolution} px wide)")
         else:
-            _log(f"pages:   {page_count}  (native resolution: {native})")
             _log(f"output:  {output_path}  (native resolution)")
+        if crop is not None:
+            trimmed = sum(
+                1 for p, c in zip(pages_list, clips) if c is not None and c != p.rect
+            )
+            _log(f"crop:    {crop}  ({trimmed} of {page_count} pages trimmed)")
 
-        pages: list[tuple[str, bytes]] = []
-        for i in range(page_count):
-            png = render_page(doc.load_page(i), resolution)
-            pages.append((f"page-{i + 1:04d}.png", png))
+        rendered: list[tuple[str, bytes]] = []
+        for i, (page, clip_raw) in enumerate(zip(pages_list, clips)):
+            clip = None if (clip_raw is None or clip_raw == page.rect) else clip_raw
+            png = render_page(page, resolution, clip)
+            rendered.append((f"page-{i + 1:04d}.png", png))
             _progress(i + 1, page_count)
     finally:
         doc.close()
+
+    pages = rendered
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     writer = _EpubWriter(output_path, title)

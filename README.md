@@ -32,6 +32,14 @@ replaced by the `epub` extension. Running without `pip install` also works via
 - `-r <num>, --resolution <num>`: target render width in pixels for the pages
   in the output file. By default the pages are rendered at the resolution the
   PDF itself declares.
+- `-c, --crop-global`: trim the white margins around the page content using
+  one common inset for all pages (safe: never clips content on any page, all
+  pages keep the same size).
+- `--crop-page`: trim the white margins around each page's own content, page
+  by page (trims more aggressively but page sizes may vary).
+
+`-c/--crop-global` and `--crop-page` are mutually exclusive; with neither
+flag the margins are left as-is.
 
 ## Examples
 

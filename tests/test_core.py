@@ -5,7 +5,7 @@ from pathlib import Path
 import pymupdf
 import pytest
 
-from epub_pdf_wrap.core import ConversionError, convert, format_size, render_page, slugify
+from epub_pdf_wrap.core import ConversionError, convert, format_size, page_clip_rect, render_page, slugify
 
 
 @pytest.fixture
@@ -157,4 +157,123 @@ def test_format_size() -> None:
     assert format_size(2048) == "2.0 KB"
     assert format_size(1536) == "1.5 KB"
     assert format_size(1536 * 1024) == "1.5 MB"
+
+
+def _png_size(png: bytes) -> tuple[int, int]:
+    import struct
+
+    return struct.unpack(">II", png[16:24])
+
+
+@pytest.fixture
+def inset_pdf(tmp_path: Path) -> Path:
+    """Two pages with content inset in the middle (real margins around it).
+
+    Page 1: content from (50, 50) to (150, 210).
+    Page 2: content from (30, 30) to (170, 230) — wider than page 1, so the
+    global (union) clip keeps the wider extent on that side.
+    """
+    doc = pymupdf.open()
+    p = doc.new_page(width=200, height=260)
+    p.insert_text((50, 80), "page one")
+    p.draw_rect(pymupdf.Rect(50, 100, 150, 200))
+    p = doc.new_page(width=200, height=260)
+    p.insert_text((30, 60), "page two")
+    p.draw_rect(pymupdf.Rect(30, 80, 170, 220))
+    out = tmp_path / "inset.pdf"
+    doc.save(str(out))
+    doc.close()
+    return out
+
+
+def test_crop_page_trims_to_content(tmp_path: Path, inset_pdf: Path) -> None:
+    out = convert(inset_pdf, tmp_path / "crop.epub", crop="page")
+
+    # Compare against the no-crop render of the same PDF
+    nocrop = convert(inset_pdf, tmp_path / "nocrop.epub")
+    import zipfile
+
+    with zipfile.ZipFile(out) as z:
+        cropped = _png_size(z.read("OEBPS/images/page-0001.png"))
+    with zipfile.ZipFile(nocrop) as z:
+        full = _png_size(z.read("OEBPS/images/page-0001.png"))
+    assert full == (200, 260)
+    # Page 1 content spans roughly 50..150 wide, 70..200 tall: the crop must
+    # clearly remove margins on all four sides.
+    assert cropped[0] < full[0] * 0.7
+    assert cropped[1] < full[1] * 0.7
+
+
+def test_crop_global_uniform_but_safe(tmp_path: Path, inset_pdf: Path) -> None:
+    out = convert(inset_pdf, tmp_path / "g.epub", crop="global")
+    import zipfile
+
+    with zipfile.ZipFile(out) as z:
+        s1 = _png_size(z.read("OEBPS/images/page-0001.png"))
+        s2 = _png_size(z.read("OEBPS/images/page-0002.png"))
+    # Union of content boxes is the same size for both pages (each clipped
+    # to the same global box), so both page images have equal dimensions.
+    assert s1 == s2
+    # The global box must never clip content: page 2, which extends
+    # furthest (30..170 wide), must not have been cut.
+    assert s1[0] >= 170 - 30
+
+
+def test_full_bleed_crop_unchanged(tmp_path: Path) -> None:
+    doc = pymupdf.open()
+    p = doc.new_page(width=200, height=260)
+    p.draw_rect(pymupdf.Rect(0, 0, 200, 260))  # content touches all edges
+    full = tmp_path / "full.pdf"
+    doc.save(str(full))
+    doc.close()
+
+    a = convert(full, tmp_path / "a.epub")
+    b = convert(full, tmp_path / "b.epub", crop="global")
+    c = convert(full, tmp_path / "c.epub", crop="page")
+    import zipfile
+
+    with zipfile.ZipFile(a) as z:
+        base = z.read("OEBPS/images/page-0001.png")
+    with zipfile.ZipFile(b) as z:
+        assert z.read("OEBPS/images/page-0001.png") == base
+    with zipfile.ZipFile(c) as z:
+        assert z.read("OEBPS/images/page-0001.png") == base
+    full.unlink()
+
+
+def test_blank_page_crop_does_not_crash(tmp_path: Path) -> None:
+    doc = pymupdf.open()
+    doc.new_page(width=200, height=260)
+    blank = tmp_path / "blank.pdf"
+    doc.save(str(blank))
+    doc.close()
+
+    a = convert(blank, tmp_path / "gb.epub", crop="global")
+    b = convert(blank, tmp_path / "pb.epub", crop="page")
+    import zipfile
+
+    for f in (a, b):
+        with zipfile.ZipFile(f) as z:
+            assert _png_size(z.read("OEBPS/images/page-0001.png")) == (200, 260)
+    blank.unlink()
+
+
+def test_crop_invalid_value_raises(inset_pdf: Path) -> None:
+    with pytest.raises(ConversionError):
+        convert(inset_pdf, inset_pdf.with_suffix(".epub"), crop="bogus")
+
+
+def test_cli_parser_crop_flags() -> None:
+    from epub_pdf_wrap.__main__ import build_parser
+
+    p = build_parser()
+    args = p.parse_args(["in.pdf", "-c"])
+    assert args.crop_global is True and args.crop_page is False
+    args = p.parse_args(["in.pdf", "--crop-global"])
+    assert args.crop_global is True
+    args = p.parse_args(["in.pdf", "--crop-page"])
+    assert args.crop_global is False and args.crop_page is True
+    with pytest.raises(SystemExit) as exc:
+        p.parse_args(["in.pdf", "-c", "--crop-page"])
+    assert exc.value.code == 2
     assert format_size(5 * 1024**3) == "5.0 GB"
