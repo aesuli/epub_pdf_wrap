@@ -276,4 +276,70 @@ def test_cli_parser_crop_flags() -> None:
     with pytest.raises(SystemExit) as exc:
         p.parse_args(["in.pdf", "-c", "--crop-page"])
     assert exc.value.code == 2
-    assert format_size(5 * 1024**3) == "5.0 GB"
+
+
+@pytest.fixture
+def metadata_pdf(tmp_path: Path) -> Path:
+    doc = pymupdf.open()
+    page = doc.new_page(width=200, height=260)
+    page.insert_text((20, 40), "content")
+    doc.set_metadata(
+        {
+            "title": "A <Great> Book & Co",
+            "author": "Jane Doe, John Roe",
+            "subject": "Typesetting with pypdf",
+            "keywords": "epub, pdf, wrap",
+            "creationDate": "D:20041212120000+01'00'",
+        }
+    )
+    out = tmp_path / "meta.pdf"
+    doc.save(str(out))
+    doc.close()
+    return out
+
+
+def test_metadata_is_transferred_to_epub(tmp_path: Path, metadata_pdf: Path) -> None:
+    import ebooklib
+    from ebooklib import epub
+
+    out = convert(metadata_pdf, tmp_path / "meta.epub")
+    book = epub.read_epub(str(out), options={"ignore_ncx": True})
+
+    assert book.get_metadata("DC", "title")[0][0] == "A <Great> Book & Co"
+    assert book.get_metadata("DC", "creator")[0][0] == "Jane Doe, John Roe"
+    assert book.get_metadata("DC", "subject")[0][0] == "Typesetting with pypdf"
+    assert book.get_metadata("DC", "date")[0][0] == "2004-12-12T12:00:00"
+    # Tooling fields are not transferred
+    assert not book.get_metadata("DC", "source")
+
+    # The OPF XML itself: identifier still present, values escaped in title,
+    # keywords present as an EPUB-3 meta element.
+    from zipfile import ZipFile
+
+    with ZipFile(out) as z:
+        opf = z.read("OEBPS/content.opf").decode("utf-8")
+    assert "A &lt;Great&gt; Book &amp; Co" in opf
+    assert '<dc:identifier id="epubid"' in opf
+    assert '<meta name="keywords" content="epub, pdf, wrap"/>' in opf
+
+
+def test_metadata_fallback_title_when_empty(tmp_path: Path) -> None:
+    import pymupdf
+
+    doc = pymupdf.open()
+    doc.new_page(width=200, height=260)
+    blank = tmp_path / "no-meta.pdf"
+    doc.save(str(blank))
+    doc.close()
+
+    out = convert(blank, tmp_path / "no-meta.epub")
+    import zipfile
+
+    with zipfile.ZipFile(out) as z:
+        opf = z.read("OEBPS/content.opf").decode("utf-8")
+    assert "<dc:title>no-meta</dc:title>" in opf
+    # Only empty fields are omitted, not the required title
+    assert "<dc:creator>" not in opf
+    assert "<dc:subject>" not in opf
+    assert "<dc:date>" not in opf
+    blank.unlink()

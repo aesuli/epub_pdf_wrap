@@ -41,6 +41,12 @@ replaced by the `epub` extension. Running without `pip install` also works via
 `-c/--crop-global` and `--crop-page` are mutually exclusive; with neither
 flag the margins are left as-is.
 
+## Metadata
+
+Document metadata (title, author, subject, keywords and creation date) is
+taken from the PDF and written into the EPUB. Empty fields are omitted; the
+title falls back to the input filename if the PDF has none.
+
 ## Examples
 
 Convert a paper at a wider resolution and name the output explicitly:

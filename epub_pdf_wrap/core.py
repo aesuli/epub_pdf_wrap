@@ -103,6 +103,56 @@ def global_clip_rects(doc: "pymupdf.Document") -> list["pymupdf.Rect"]:
     return clips
 
 
+def _clean(value: str) -> str:
+    return " ".join(value.split()) if value else ""
+
+
+def _w3cdtf(value: str) -> str:
+    """Convert a PDF creation date (``D:YYYYMMDDHHmmSSz``) to W3CDTF, or
+    ``""`` if it does not look parseable."""
+    s = value.strip()
+    if not s:
+        return ""
+    if s.startswith("D:"):
+        s = s[2:]
+    digits = s[:14]
+    if len(digits) < 8 or not digits[:8].isdigit():
+        return ""
+    if len(digits) == 8:
+        return f"{digits[0:4]}-{digits[4:6]}-{digits[6:8]}"
+    if len(digits) == 14 and digits[8:14].isdigit():
+        return (
+            f"{digits[0:4]}-{digits[4:6]}-{digits[6:8]}"
+            f"T{digits[8:10]}:{digits[10:12]}:{digits[12:14]}"
+        )
+    return ""
+
+
+def epub_metadata(doc: "pymupdf.Document") -> dict:
+    """Transfer the PDF document metadata into an EPUB-friendly mapping.
+
+    Only non-empty fields are included: ``title``, ``creator`` (from the PDF
+    ``author``), ``subject``, ``keywords`` and ``date`` (from the PDF
+    ``creationDate``, W3CDTF). Tooling fields (creator/producer) are
+    deliberately skipped.
+    """
+    meta = doc.metadata or {}
+    out: dict[str, str] = {}
+    for key, field in (
+        ("title", "title"),
+        ("creator", "author"),
+        ("subject", "subject"),
+        ("keywords", "keywords"),
+    ):
+        if value := _clean(meta.get(field) or ""):
+            out[key] = value
+    for field in ("creationDate", "modDate"):
+        if value := _w3cdtf(meta.get(field) or ""):
+            out["date"] = value
+            break
+    return out
+
+
 def render_page(page: "pymupdf.Page", resolution: int | None = None,
                 clip: "pymupdf.Rect | None" = None) -> bytes:
     """Render one PDF page to a PNG byte string.
@@ -132,9 +182,9 @@ class _EpubWriter:
     which strict readers require.
     """
 
-    def __init__(self, path: Path, title: str):
+    def __init__(self, path: Path, metadata: dict):
         self.path = Path(path)
-        self.title = title
+        self.metadata = metadata
         self.image_names: list[str] = []
         self.images: list[bytes] = []
         self.uuid = str(uuid.uuid4())
@@ -159,6 +209,24 @@ class _EpubWriter:
             "</rootfiles></container>"
         )
 
+    def _metadata_xml(self) -> str:
+        # Order follows the OPF/DC convention; only fields present are emitted.
+        parts = [f'<dc:identifier id="epubid">{self.uuid}</dc:identifier>']
+        if "title" in self.metadata:
+            parts.append(f"<dc:title>{escape(self.metadata['title'])}</dc:title>")
+        if "creator" in self.metadata:
+            parts.append(f"<dc:creator>{escape(self.metadata['creator'])}</dc:creator>")
+        if "subject" in self.metadata:
+            parts.append(f"<dc:subject>{escape(self.metadata['subject'])}</dc:subject>")
+        if "date" in self.metadata:
+            parts.append(f"<dc:date>{escape(self.metadata['date'])}</dc:date>")
+        parts.append("<dc:language>en</dc:language>")
+        if "keywords" in self.metadata:
+            parts.append(
+                f'<meta name="keywords" content="{escape(self.metadata["keywords"])}"/>'
+            )
+        return "".join(parts)
+
     def _opf_xml(self) -> str:
         manifest = (
             '<item id="ncx" media-type="application/x-dtbncx+xml" href="toc.ncx"/>'
@@ -180,9 +248,7 @@ class _EpubWriter:
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             '<package xmlns="http://www.idpf.org/2007/opf" version="2.0">'
             '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">'
-            f'<dc:identifier id="epubid">{self.uuid}</dc:identifier>'
-            f"<dc:title>{escape(self.title)}</dc:title>"
-            "<dc:language>en</dc:language>"
+            f"{self._metadata_xml()}"
             "</metadata>"
             f"<manifest>{manifest}</manifest>"
             f'<spine toc="ncx">{spine}</spine></package>'
@@ -200,7 +266,7 @@ class _EpubWriter:
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             '<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">'
             f'<head><meta name="dtb:uid" content="{self.uuid}"/></head>'
-            f"<docTitle><text>{escape(self.title)}</text></docTitle>"
+            f"<docTitle><text>{escape(self.metadata.get('title', 'Document'))}</text></docTitle>"
             f"<navMap>{nav}</navMap></ncx>"
         )
 
@@ -294,7 +360,8 @@ def convert(input_path: Path, output_path: Path | None = None,
         page_count = doc.page_count
         if page_count == 0:
             raise ConversionError(f"PDF has no pages: {input_path}")
-        title = doc.metadata.get("title") or slugify(input_path.stem)
+        metadata = epub_metadata(doc)
+        metadata.setdefault("title", slugify(input_path.stem))
         pages_list = [doc.load_page(i) for i in range(page_count)]
 
         first = pages_list[0]
@@ -332,7 +399,7 @@ def convert(input_path: Path, output_path: Path | None = None,
     pages = rendered
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    writer = _EpubWriter(output_path, title)
+    writer = _EpubWriter(output_path, metadata)
     for name, data in pages:
         writer.add_image(name, data)
     writer.build()
