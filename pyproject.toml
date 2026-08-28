@@ -13,6 +13,7 @@ license-files = ["LICENSE"]
 authors = [
     { name = "Andrea Esuli", email = "andrea@esuli.it" },
 ]
+urls = { "Home" = "https://github.com/aesuli/epub_pdf_wrap" }
 keywords = ["pdf", "epub", "conversion", "render"]
 classifiers = [
     "Development Status :: 3 - Alpha",
