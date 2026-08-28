@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,20 @@ version = "0.1.0"
 description = "Convert a PDF to an EPUB by wrapping each rendered page in an EPUB page"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Andrea Esuli", email = "andrea@esuli.it" },
+]
+keywords = ["pdf", "epub", "conversion", "render"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Text Processing :: Markup :: HTML",
+]
 dependencies = [
     "PyMuPDF>=1.24",
 ]

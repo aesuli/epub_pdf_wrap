@@ -65,3 +65,8 @@ pytest
 ```
 
 `samples/` contains real input PDFs for manually verifying the output.
+
+## License
+
+Distributed under the BSD 3-Clause License; see `LICENSE`.
+Copyright (c) 2026, Andrea Esuli (andrea@esuli.it).

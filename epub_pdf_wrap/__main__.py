@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 
+from . import __version__
 from .core import ConversionError, convert
 
 
@@ -16,6 +17,10 @@ def build_parser() -> argparse.ArgumentParser:
             "of the PDF in an EPUB page. Aims at PDFs whose layout would be "
             "corrupted by text-based conversion (comics, scientific papers)."
         ),
+        epilog="Copyright (c) 2026 Andrea Esuli — BSD-3-Clause license",
+    )
+    parser.add_argument(
+        "-V", "--version", action="version", version=f"epub-pdf-wrap {__version__}",
     )
     parser.add_argument("input", help="input PDF file")
     parser.add_argument(
