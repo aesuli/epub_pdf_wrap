@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "epub-pdf-wrap"
+version = "0.1.0"
+description = "Convert a PDF to an EPUB by wrapping each rendered page in an EPUB page"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "PyMuPDF>=1.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "ebooklib>=0.18",
+]
+
+[project.scripts]
+epub-pdf-wrap = "epub_pdf_wrap.__main__:main"
+
+[tool.setuptools]
+packages = ["epub_pdf_wrap"]
