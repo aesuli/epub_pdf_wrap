@@ -287,7 +287,6 @@ class _EpubWriter:
             f"<head><title>Page {index}</title>"
             f'<style type="text/css">{css}</style></head>'
             '<body epub:type="bodymatter">'
-            f'<p style="margin:0;padding:0;border:none;">\u200b</p>'
             f'<img src="images/{escape(name)}" alt="Page {index}"/>'
             "</body></html>"
         )

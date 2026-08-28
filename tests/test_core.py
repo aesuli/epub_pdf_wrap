@@ -35,6 +35,24 @@ def test_convert_produces_epub(tmp_path: Path, tiny_pdf: Path) -> None:
         assert "OEBPS/images/page-0002.png" in names
 
 
+def test_page_xhtml_body_contains_only_the_page_image(
+    tmp_path: Path, tiny_pdf: Path
+) -> None:
+    import xml.etree.ElementTree as ET
+    import zipfile
+
+    out = convert(tiny_pdf, tmp_path / "image-only.epub")
+    with zipfile.ZipFile(out) as z:
+        xhtml = z.read("OEBPS/page-0001.xhtml").decode("utf-8")
+
+    root = ET.fromstring(xhtml)
+    body = root.find("{http://www.w3.org/1999/xhtml}body")
+    assert body is not None
+    assert not (body.text or "").strip()
+    assert [child.tag for child in body] == ["{http://www.w3.org/1999/xhtml}img"]
+    assert not (body[0].tail or "").strip()
+
+
 def test_epub_is_readable_by_ebooklib(tmp_path: Path, tiny_pdf: Path) -> None:
     """Reader-grade check: ebooklib must parse metadata, spine and content."""
     import ebooklib
