@@ -1,0 +1,64 @@
+name: Publish
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Skip version-bump commits (avoid publish loop)
+        id: skip
+        run: |
+          email=$(git log -1 --pretty=%ae)
+          if [[ "$email" == *"github-actions[bot]"* ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump patch version
+        if: steps.skip.outputs.skip != 'true'
+        run: |
+          python - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("pyproject.toml")
+          t = p.read_text(encoding="utf-8")
+          m = re.search(r'^version = "(\d+)\.(\d+)\.(\d+)"', t, re.M)
+          assert m, "could not find version in pyproject.toml"
+          major, minor, patch = (int(g) for g in m.groups())
+          new = f"{major}.{minor}.{patch + 1}"
+          t = re.sub(r'^version = ".*?"', f'version = "{new}"', t, count=1, flags=re.M)
+          p.write_text(t, encoding="utf-8")
+          print(f"bumped {m.group(1)}.{m.group(2)}.{m.group(3)} -> {new}")
+          PY
+
+      - name: Commit and push new version
+        if: steps.skip.outputs.skip != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          # numeric committer id is required by the newer GitHub Actions push policy
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore(release): bump package version"
+          git push
+
+      - name: Build distributions
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+
+      - name: Publish to PyPI
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          TWINE_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
+        run: twine upload --non-interactive --username __token__ dist/*
