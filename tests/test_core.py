@@ -225,6 +225,41 @@ def test_bad_resolution_raises(tiny_pdf: Path) -> None:
         doc.close()
 
 
+def test_page_background_is_opaque_by_default_and_transparency_is_optional() -> None:
+    doc = pymupdf.open()
+    page = doc.new_page(width=20, height=20)
+    try:
+        opaque = render_page(page)
+        transparent = render_page(page, transparent_background=True)
+    finally:
+        doc.close()
+
+    # PNG IHDR color type: 2 is RGB, 6 is RGBA.
+    assert opaque[25] == 2
+    assert transparent[25] == 6
+
+
+def test_convert_passes_background_setting_to_page_images(
+    tmp_path: Path, tiny_pdf: Path
+) -> None:
+    import zipfile
+
+    opaque_epub = convert(tiny_pdf, tmp_path / "opaque.epub")
+    transparent_epub = convert(
+        tiny_pdf,
+        tmp_path / "transparent.epub",
+        transparent_background=True,
+    )
+
+    with zipfile.ZipFile(opaque_epub) as z:
+        opaque = z.read("OEBPS/images/page-0001.png")
+    with zipfile.ZipFile(transparent_epub) as z:
+        transparent = z.read("OEBPS/images/page-0001.png")
+
+    assert opaque[25] == 2
+    assert transparent[25] == 6
+
+
 def test_convert_reports_input_info_and_progress(tmp_path: Path, tiny_pdf: Path) -> None:
     logged: list[str] = []
     steps: list[tuple[int, int]] = []
@@ -399,10 +434,13 @@ def test_cli_parser_crop_flags() -> None:
     args = p.parse_args(["in.pdf"])
     assert args.nocover is False
     assert args.epub2 is False
+    assert args.transparent_background is False
     args = p.parse_args(["in.pdf", "--nocover"])
     assert args.nocover is True
     args = p.parse_args(["in.pdf", "--epub2"])
     assert args.epub2 is True
+    args = p.parse_args(["in.pdf", "--transparent-background"])
+    assert args.transparent_background is True
 
 
 @pytest.fixture

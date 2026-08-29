@@ -41,6 +41,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="trim white margins per page, to each page's own content",
     )
     parser.add_argument(
+        "--transparent-background", action="store_true",
+        help="preserve unpainted page areas as transparent (default: white)",
+    )
+    parser.add_argument(
         "--nocover", action="store_true",
         help="do not use the first page as the book's cover (default: cover on)",
     )
@@ -74,6 +78,7 @@ def main(argv: list[str] | None = None) -> int:
             crop=crop,
             cover=not args.nocover,
             epub2=args.epub2,
+            transparent_background=args.transparent_background,
             log=lambda line: print(line),
             progress=_progress,
         )

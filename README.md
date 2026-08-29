@@ -40,6 +40,9 @@ replaced by the `epub` extension. Running without `pip install` also works via
   pages keep the same size).
 - `--crop-page`: trim the white margins around each page's own content, page
   by page (trims more aggressively but page sizes may vary).
+- `--transparent-background`: preserve unpainted PDF page areas as transparent
+  PNG pixels. By default they are rendered white for consistent display across
+  reader themes.
 - `--nocover`: skip using the first page as the book's cover image. By
   default the first page of the PDF is also set as the EPUB cover.
 - `--epub2`: generate EPUB 2 output for older readers. The default is EPUB 3

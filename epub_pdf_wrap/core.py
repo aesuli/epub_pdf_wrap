@@ -156,12 +156,15 @@ def epub_metadata(doc: "pymupdf.Document") -> dict:
 
 
 def render_page(page: "pymupdf.Page", resolution: int | None = None,
-                clip: "pymupdf.Rect | None" = None) -> bytes:
+                clip: "pymupdf.Rect | None" = None,
+                transparent_background: bool = False) -> bytes:
     """Render one PDF page to a PNG byte string.
 
     *resolution*, when given, is the target width in pixels; the height is
     scaled proportionally. *clip*, when given, is a ``Rect`` in page
     coordinates to render only that region (e.g. with margins trimmed).
+    Unpainted page areas are white by default; set *transparent_background*
+    to preserve them as transparent PNG pixels.
     """
     rect = clip if clip is not None else page.rect
     if resolution is not None:
@@ -170,7 +173,7 @@ def render_page(page: "pymupdf.Page", resolution: int | None = None,
         scale = resolution / rect.width
     else:
         scale = 1.0
-    kwargs = {"alpha": True, "colorspace": pymupdf.csRGB}
+    kwargs = {"alpha": transparent_background, "colorspace": pymupdf.csRGB}
     if clip is not None:
         kwargs["clip"] = clip
     pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), **kwargs)
@@ -405,7 +408,8 @@ def format_size(num_bytes: int) -> str:
 def convert(input_path: Path, output_path: Path | None = None,
             resolution: int | None = None, crop: str | None = None,
             cover: bool = True, log=None, progress=None,
-            epub2: bool = False) -> Path:
+            epub2: bool = False,
+            transparent_background: bool = False) -> Path:
     """Convert *input_path* (a PDF) to an EPUB and return the output path.
 
     Every PDF page is rendered to a PNG and placed in its own EPUB section in
@@ -418,6 +422,8 @@ def convert(input_path: Path, output_path: Path | None = None,
     When *cover* is true (the default) the first page also becomes the book's
     cover image. EPUB 3 fixed-layout output is the default; when *epub2* is
     true, the output uses EPUB 2 markup for compatibility with older readers.
+    Unpainted page areas are rendered white unless *transparent_background*
+    is true.
 
     *log* (optional callable(str)) receives descriptive lines (input info,
     output result). *progress* (optional callable(done, total)) is called for
@@ -486,7 +492,10 @@ def convert(input_path: Path, output_path: Path | None = None,
         rendered: list[tuple[str, bytes]] = []
         for i, (page, clip_raw) in enumerate(zip(pages_list, clips)):
             clip = None if (clip_raw is None or clip_raw == page.rect) else clip_raw
-            png = render_page(page, resolution, clip)
+            png = render_page(
+                page, resolution, clip,
+                transparent_background=transparent_background,
+            )
             rendered.append((f"page-{i + 1:04d}.png", png))
             _progress(i + 1, page_count)
     finally:
