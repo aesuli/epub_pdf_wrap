@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "epub-pdf-wrap"
-version = "0.1.1"
+version = "0.1.2"
 description = "Convert a PDF to an EPUB by wrapping each rendered page in an EPUB page"
 readme = "README.md"
 requires-python = ">=3.9"
