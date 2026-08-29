@@ -44,6 +44,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--nocover", action="store_true",
         help="do not use the first page as the book's cover (default: cover on)",
     )
+    parser.add_argument(
+        "--epub2", action="store_true",
+        help="write EPUB 2 instead of EPUB 3 for compatibility with older readers",
+    )
     return parser
 
 
@@ -69,6 +73,7 @@ def main(argv: list[str] | None = None) -> int:
             args.resolution,
             crop=crop,
             cover=not args.nocover,
+            epub2=args.epub2,
             log=lambda line: print(line),
             progress=_progress,
         )

@@ -5,6 +5,9 @@ an EPUB page. This is specifically aimed at PDF files that cannot be converted
 into EPUB any other way without corrupting their visual rendering (comics,
 scientific papers...).
 
+The generated EPUB uses EPUB 3 fixed-layout metadata by default: each PDF page
+is one pre-paginated spine item.
+
 ## Installation
 
 ```
@@ -20,7 +23,7 @@ pip install -e ".[dev]"
 ## Usage
 
 ```
-epub-pdf-wrap <pdf-filename> [-o <epub-filename>]
+epub-pdf-wrap <pdf-filename> [options]
 ```
 
 By default the output filename is the input filename with the `pdf` extension
@@ -39,6 +42,8 @@ replaced by the `epub` extension. Running without `pip install` also works via
   by page (trims more aggressively but page sizes may vary).
 - `--nocover`: skip using the first page as the book's cover image. By
   default the first page of the PDF is also set as the EPUB cover.
+- `--epub2`: generate EPUB 2 output for older readers. The default is EPUB 3
+  fixed-layout output.
 
 `-c/--crop-global` and `--crop-page` are mutually exclusive; with neither
 flag the margins are left as-is.

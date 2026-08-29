@@ -53,6 +53,62 @@ def test_page_xhtml_body_contains_only_the_page_image(
     assert not (body[0].tail or "").strip()
 
 
+def test_epub_declares_image_pages_as_fixed_layout(
+    tmp_path: Path, tiny_pdf: Path
+) -> None:
+    import zipfile
+
+    out = convert(tiny_pdf, tmp_path / "fixed-layout.epub")
+    with zipfile.ZipFile(out) as z:
+        opf = z.read("OEBPS/content.opf").decode("utf-8")
+        page = z.read("OEBPS/page-0001.xhtml").decode("utf-8")
+        nav = z.read("OEBPS/nav.xhtml").decode("utf-8")
+
+    assert 'version="3.0"' in opf
+    assert 'unique-identifier="epubid"' in opf
+    assert '<meta property="dcterms:modified">' in opf
+    assert '<meta property="rendition:layout">pre-paginated</meta>' in opf
+    assert '<meta property="rendition:spread">none</meta>' in opf
+    assert 'properties="nav" href="nav.xhtml"' in opf
+    assert '<meta name="viewport" content="width=200, height=260"/>' in page
+    assert '<nav epub:type="page-list"' in nav
+    assert nav.count('<a href="page-') == 4
+
+
+def test_epub2_uses_legacy_package_and_navigation(
+    tmp_path: Path, tiny_pdf: Path
+) -> None:
+    import ebooklib
+    from ebooklib import epub
+    import zipfile
+
+    out = convert(tiny_pdf, tmp_path / "legacy.epub", epub2=True)
+    with zipfile.ZipFile(out) as z:
+        names = z.namelist()
+        opf = z.read("OEBPS/content.opf").decode("utf-8")
+        page = z.read("OEBPS/page-0001.xhtml").decode("utf-8")
+
+    assert 'version="2.0"' in opf
+    assert 'unique-identifier="epubid"' in opf
+    assert '<spine toc="ncx">' in opf
+    assert '<meta name="cover" content="cover"/>' in opf
+    assert 'properties="cover-image"' not in opf
+    assert "rendition:" not in opf
+    assert "dcterms:modified" not in opf
+    assert "OEBPS/toc.ncx" in names
+    assert "OEBPS/nav.xhtml" not in names
+    assert "XHTML 1.1" in page
+    assert "epub:type" not in page
+    assert '<div class="page"><img ' in page
+
+    book = epub.read_epub(str(out))
+    assert [ref for ref, _ in book.spine] == ["sec-0000", "sec-0001"]
+    assert {item.get_name() for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT)} == {
+        "page-0001.xhtml",
+        "page-0002.xhtml",
+    }
+
+
 def test_epub_is_readable_by_ebooklib(tmp_path: Path, tiny_pdf: Path) -> None:
     """Reader-grade check: ebooklib must parse metadata, spine and content."""
     import ebooklib
@@ -97,7 +153,15 @@ def test_epub_is_readable_by_ebooklib(tmp_path: Path, tiny_pdf: Path) -> None:
     # A default load must also succeed without the ignore_ncx bypass:
     # the NCX toc id has to resolve in the manifest (id="ncx").
     fresh = epub.read_epub(str(out))
-    assert len(list(fresh.get_items_of_type(ebooklib.ITEM_DOCUMENT))) == 2
+    documents = list(fresh.get_items_of_type(ebooklib.ITEM_DOCUMENT))
+    assert {item.get_name() for item in documents} == {
+        "nav.xhtml",
+        "page-0001.xhtml",
+        "page-0002.xhtml",
+    }
+    assert fresh.get_item_with_id("nav") not in [
+        fresh.get_item_with_id(ref) for ref, _ in fresh.spine
+    ]
     # Navigation must provide one TOC entry per page, each resolving to a
     # real item (this is what readers do when a user opens the TOC).
     toc = list(fresh.toc)
@@ -334,8 +398,11 @@ def test_cli_parser_crop_flags() -> None:
     assert exc.value.code == 2
     args = p.parse_args(["in.pdf"])
     assert args.nocover is False
+    assert args.epub2 is False
     args = p.parse_args(["in.pdf", "--nocover"])
     assert args.nocover is True
+    args = p.parse_args(["in.pdf", "--epub2"])
+    assert args.epub2 is True
 
 
 @pytest.fixture

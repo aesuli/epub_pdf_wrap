@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import re
+import struct
 import time
 import uuid
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -176,20 +178,23 @@ def render_page(page: "pymupdf.Page", resolution: int | None = None,
 
 
 class _EpubWriter:
-    """Minimal EPUB 2 writer: one XHTML section per page, one PNG per page.
+    """Minimal EPUB writer: one XHTML section per page, one PNG per page.
 
     The spine is built from the XHTML sections (never directly from images),
     which strict readers require.
     """
 
     def __init__(self, path: Path, metadata: dict,
-                 cover: "tuple[str, bytes] | None" = None):
+                 cover: "tuple[str, bytes] | None" = None,
+                 epub2: bool = False):
         self.path = Path(path)
         self.metadata = metadata
         self.cover = cover
+        self.epub2 = epub2
         self.image_names: list[str] = []
         self.images: list[bytes] = []
         self.uuid = str(uuid.uuid4())
+        self.modified = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         self._tmp = self.path.with_suffix(self.path.suffix + ".tmp")
 
     def add_image(self, name: str, data: bytes):
@@ -223,6 +228,18 @@ class _EpubWriter:
         if "date" in self.metadata:
             parts.append(f"<dc:date>{escape(self.metadata['date'])}</dc:date>")
         parts.append("<dc:language>en</dc:language>")
+        if self.epub2:
+            if self.cover is not None:
+                parts.append('<meta name="cover" content="cover"/>')
+        else:
+            parts.extend(
+                (
+                    f'<meta property="dcterms:modified">{self.modified}</meta>',
+                    '<meta property="rendition:layout">pre-paginated</meta>',
+                    '<meta property="rendition:orientation">auto</meta>',
+                    '<meta property="rendition:spread">none</meta>',
+                )
+            )
         if "keywords" in self.metadata:
             parts.append(
                 f'<meta name="keywords" content="{escape(self.metadata["keywords"])}"/>'
@@ -230,9 +247,14 @@ class _EpubWriter:
         return "".join(parts)
 
     def _opf_xml(self) -> str:
-        manifest = (
-            '<item id="ncx" media-type="application/x-dtbncx+xml" href="toc.ncx"/>'
-            + "".join(
+        manifest = '<item id="ncx" media-type="application/x-dtbncx+xml" href="toc.ncx"/>'
+        if not self.epub2:
+            manifest += (
+                '<item id="nav" media-type="application/xhtml+xml" '
+                'properties="nav" href="nav.xhtml"/>'
+            )
+        manifest += (
+            "".join(
                 f'<item id="{sid}" media-type="application/xhtml+xml" '
                 f'href="page-{i:04d}.xhtml"/>'
                 for i, sid in enumerate(self._section_ids, start=1)
@@ -244,16 +266,19 @@ class _EpubWriter:
             )
         )
         if self.cover is not None:
+            properties = "" if self.epub2 else ' properties="cover-image"'
             manifest += (
-                '<item id="cover" media-type="image/png" '
-                'properties="cover-image" href="images/cover.png"/>'
+                f'<item id="cover" media-type="image/png"{properties} '
+                'href="images/cover.png"/>'
             )
         spine = "".join(
             f'<itemref idref="{sid}"/>' for sid in self._section_ids
         )
+        version = "2.0" if self.epub2 else "3.0"
         return (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
-            '<package xmlns="http://www.idpf.org/2007/opf" version="2.0">'
+            f'<package xmlns="http://www.idpf.org/2007/opf" version="{version}" '
+            'unique-identifier="epubid">'
             '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">'
             f"{self._metadata_xml()}"
             "</metadata>"
@@ -277,14 +302,64 @@ class _EpubWriter:
             f"<navMap>{nav}</navMap></ncx>"
         )
 
-    def _section_xhtml(self, index: int, name: str) -> str:
-        css = "html,body{margin:0;padding:0;}img{display:block;max-width:100vw;margin:auto;}"
+    def _nav_xhtml(self) -> str:
+        toc = "".join(
+            f'<li><a href="page-{i:04d}.xhtml">Page {i}</a></li>'
+            for i in range(1, len(self.image_names) + 1)
+        )
+        page_list = "".join(
+            f'<li><a href="page-{i:04d}.xhtml">{i}</a></li>'
+            for i in range(1, len(self.image_names) + 1)
+        )
         return (
-            '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" '
-            '"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">\n'
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE html>'
+            '<html xmlns="http://www.w3.org/1999/xhtml" '
+            'xmlns:epub="http://www.idpf.org/2007/ops" lang="en" xml:lang="en">'
+            '<head><title>Navigation</title></head><body>'
+            '<nav epub:type="toc" id="toc"><h1>Contents</h1>'
+            f'<ol>{toc}</ol></nav>'
+            '<nav epub:type="page-list" id="page-list"><h2>Pages</h2>'
+            f'<ol>{page_list}</ol></nav>'
+            '</body></html>'
+        )
+
+    def _section_xhtml(self, index: int, name: str, data: bytes) -> str:
+        if (
+            len(data) < 24
+            or data[:8] != b"\x89PNG\r\n\x1a\n"
+            or data[12:16] != b"IHDR"
+        ):
+            raise ConversionError(f"page image is not a valid PNG: {name}")
+        width, height = struct.unpack(">II", data[16:24])
+        if self.epub2:
+            css = (
+                "html,body,.page{margin:0;padding:0;width:100%;}"
+                "img{display:block;width:100%;height:auto;}"
+            )
+            return (
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" '
+                '"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">\n'
+                '<html xmlns="http://www.w3.org/1999/xhtml" '
+                'xml:lang="en">'
+                f"<head><title>Page {index}</title>"
+                f'<style type="text/css">{css}</style></head><body>'
+                '<div class="page">'
+                f'<img src="images/{escape(name)}" alt="Page {index}"/>'
+                "</div></body></html>"
+            )
+        css = (
+            "html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;}"
+            "img{display:block;width:100%;height:100%;}"
+        )
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE html>'
             '<html xmlns="http://www.w3.org/1999/xhtml" lang="en" '
-            'xmlns:epub="http://www.idpf.org/2007/ops">'
+            'xml:lang="en" xmlns:epub="http://www.idpf.org/2007/ops">'
             f"<head><title>Page {index}</title>"
+            f'<meta name="viewport" content="width={width}, height={height}"/>'
             f'<style type="text/css">{css}</style></head>'
             '<body epub:type="bodymatter">'
             f'<img src="images/{escape(name)}" alt="Page {index}"/>'
@@ -299,8 +374,15 @@ class _EpubWriter:
             z.writestr("META-INF/container.xml", self._container_xml())
             z.writestr("OEBPS/content.opf", self._opf_xml())
             z.writestr("OEBPS/toc.ncx", self._ncx_xml())
-            for i, name in enumerate(self.image_names, start=1):
-                z.writestr(f"OEBPS/page-{i:04d}.xhtml", self._section_xhtml(i, name))
+            if not self.epub2:
+                z.writestr("OEBPS/nav.xhtml", self._nav_xhtml())
+            for i, (name, data) in enumerate(
+                zip(self.image_names, self.images), start=1
+            ):
+                z.writestr(
+                    f"OEBPS/page-{i:04d}.xhtml",
+                    self._section_xhtml(i, name, data),
+                )
             for name, data in zip(self.image_names, self.images):
                 z.writestr(f"OEBPS/images/{name}", data)
             if self.cover is not None:
@@ -322,8 +404,8 @@ def format_size(num_bytes: int) -> str:
 
 def convert(input_path: Path, output_path: Path | None = None,
             resolution: int | None = None, crop: str | None = None,
-            cover: bool = True,
-            log=None, progress=None) -> Path:
+            cover: bool = True, log=None, progress=None,
+            epub2: bool = False) -> Path:
     """Convert *input_path* (a PDF) to an EPUB and return the output path.
 
     Every PDF page is rendered to a PNG and placed in its own EPUB section in
@@ -334,7 +416,8 @@ def convert(input_path: Path, output_path: Path | None = None,
     page to its own content.
 
     When *cover* is true (the default) the first page also becomes the book's
-    cover image.
+    cover image. EPUB 3 fixed-layout output is the default; when *epub2* is
+    true, the output uses EPUB 2 markup for compatibility with older readers.
 
     *log* (optional callable(str)) receives descriptive lines (input info,
     output result). *progress* (optional callable(done, total)) is called for
@@ -393,6 +476,7 @@ def convert(input_path: Path, output_path: Path | None = None,
             _log(f"output:  {output_path}  ({resolution} px wide)")
         else:
             _log(f"output:  {output_path}  (native resolution)")
+        _log(f"format:  EPUB {2 if epub2 else 3}")
         if crop is not None:
             trimmed = sum(
                 1 for p, c in zip(pages_list, clips) if c is not None and c != p.rect
@@ -413,7 +497,7 @@ def convert(input_path: Path, output_path: Path | None = None,
     cover_data = ("cover.png", pages[0][1]) if cover else None
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    writer = _EpubWriter(output_path, metadata, cover=cover_data)
+    writer = _EpubWriter(output_path, metadata, cover=cover_data, epub2=epub2)
     for name, data in pages:
         writer.add_image(name, data)
     writer.build()

@@ -38,6 +38,34 @@ try:
         with target.open("rb") as f:
             head = f.read(30)
         print("first 30 bytes:", head)
+        opf = ET.fromstring(z.read("OEBPS/content.opf"))
+        opf_ns = {"opf": "http://www.idpf.org/2007/opf"}
+        version = opf.get("version")
+        if version not in ("2.0", "3.0"):
+            errors += 1
+            print("PACKAGE ERROR: expected EPUB version 2.0 or 3.0")
+        print("package version:", version)
+        ncx = opf.find("opf:manifest/opf:item[@id='ncx']", opf_ns)
+        spine = opf.find("opf:spine", opf_ns)
+        ncx_path = f"OEBPS/{ncx.get('href')}" if ncx is not None else None
+        if ncx_path not in z.namelist() or spine is None or spine.get("toc") != "ncx":
+            errors += 1
+            print("PACKAGE ERROR: NCX manifest item and spine reference are required")
+        if version == "3.0":
+            layout = opf.find(
+                "opf:metadata/opf:meta[@property='rendition:layout']", opf_ns
+            )
+            if layout is None or layout.text != "pre-paginated":
+                errors += 1
+                print("PACKAGE ERROR: missing pre-paginated fixed-layout metadata")
+            nav = opf.find("opf:manifest/opf:item[@properties='nav']", opf_ns)
+            nav_path = f"OEBPS/{nav.get('href')}" if nav is not None else None
+            if nav_path not in z.namelist():
+                errors += 1
+                print("PACKAGE ERROR: navigation document is missing")
+        elif "OEBPS/nav.xhtml" in z.namelist():
+            errors += 1
+            print("PACKAGE ERROR: EPUB 2 unexpectedly contains an EPUB 3 nav")
         for name in z.namelist():
             if name.endswith((".opf", ".xhtml", ".ncx", "container.xml")):
                 try:
