@@ -35,6 +35,11 @@ replaced by the `epub` extension. Running without `pip install` also works via
 - `-r <num>, --resolution <num>`: target render width in pixels for the pages
   in the output file. By default the pages are rendered at the resolution the
   PDF itself declares.
+- `--margin <pixels>`: add a uniform margin to every side of each rendered
+  page. The value must be an integer greater than or equal to zero.
+- `--margins <top> <right> <bottom> <left>`: add a separate margin to each
+  side of every rendered page. Values are output pixels and must be integers
+  greater than or equal to zero.
 - `-c, --crop-global`: trim the white margins around the page content using
   one common inset for all pages (safe: never clips content on any page, all
   pages keep the same size).
@@ -51,6 +56,9 @@ replaced by the `epub` extension. Running without `pip install` also works via
 `-c/--crop-global` and `--crop-page` are mutually exclusive; with neither
 flag the margins are left as-is.
 
+`--margin` and `--margins` are mutually exclusive. Added margins are applied
+after cropping and scaling, so their sizes are exact output pixel counts.
+
 ## Metadata
 
 Document metadata (title, author, subject, keywords and creation date) is
@@ -63,6 +71,13 @@ Convert a paper at a wider resolution and name the output explicitly:
 
 ```
 epub-pdf-wrap paper.pdf -o paper.epub -r 1400
+```
+
+Add 20 pixels around every side, or use different values for each side:
+
+```
+epub-pdf-wrap comic.pdf --margin 20
+epub-pdf-wrap comic.pdf --margins 10 20 30 40
 ```
 
 ## Development

@@ -191,6 +191,31 @@ def test_resolution_flag(tmp_path: Path, tiny_pdf: Path) -> None:
     assert width == 600
 
 
+def test_margins_add_exact_output_pixels(tmp_path: Path, tiny_pdf: Path) -> None:
+    out = convert(
+        tiny_pdf,
+        tmp_path / "margins.epub",
+        resolution=100,
+        margins=(10, 20, 30, 40),
+    )
+    import zipfile
+
+    with zipfile.ZipFile(out) as z:
+        png = z.read("OEBPS/images/page-0001.png")
+
+    # The 200 x 260 page renders to 100 x 130 before padding.
+    assert _png_size(png) == (160, 170)
+
+
+@pytest.mark.parametrize(
+    "margins",
+    [(-1, 0, 0, 0), (0, 0, 0), (0, 0, 0, 1.5), 1],
+)
+def test_invalid_margins_raise(tiny_pdf: Path, margins) -> None:
+    with pytest.raises(ConversionError):
+        convert(tiny_pdf, tiny_pdf.with_suffix(".epub"), margins=margins)
+
+
 def test_blank_only_pdf_still_produces_epub(tmp_path: Path) -> None:
     doc = pymupdf.open()
     doc.new_page(width=200, height=260)
@@ -237,6 +262,31 @@ def test_page_background_is_opaque_by_default_and_transparency_is_optional() -> 
     # PNG IHDR color type: 2 is RGB, 6 is RGBA.
     assert opaque[25] == 2
     assert transparent[25] == 6
+
+
+def test_added_margin_uses_the_requested_background_and_offsets() -> None:
+    doc = pymupdf.open()
+    page = doc.new_page(width=10, height=10)
+    page.draw_rect(page.rect, color=(0, 0, 0), fill=(0, 0, 0), width=0)
+    try:
+        opaque = pymupdf.Pixmap(render_page(page, margins=(2, 3, 4, 5)))
+        transparent = pymupdf.Pixmap(
+            render_page(
+                page,
+                transparent_background=True,
+                margins=(2, 3, 4, 5),
+            )
+        )
+    finally:
+        doc.close()
+
+    assert opaque.pixel(0, 0) == (255, 255, 255)
+    assert opaque.pixel(5, 2) == (0, 0, 0)
+    assert opaque.pixel(14, 11) == (0, 0, 0)
+    assert opaque.pixel(15, 11) == (255, 255, 255)
+    assert transparent.pixel(0, 0)[-1] == 0
+    assert transparent.pixel(5, 2) == (0, 0, 0, 255)
+    assert transparent.pixel(14, 11) == (0, 0, 0, 255)
 
 
 def test_convert_passes_background_setting_to_page_images(
@@ -441,6 +491,24 @@ def test_cli_parser_crop_flags() -> None:
     assert args.epub2 is True
     args = p.parse_args(["in.pdf", "--transparent-background"])
     assert args.transparent_background is True
+
+
+def test_cli_parser_margin_flags() -> None:
+    from epub_pdf_wrap.__main__ import build_parser
+
+    p = build_parser()
+    args = p.parse_args(["in.pdf", "--margin", "12"])
+    assert args.margin == 12 and args.margins is None
+    args = p.parse_args(["in.pdf", "--margins", "1", "2", "3", "4"])
+    assert args.margin is None and args.margins == [1, 2, 3, 4]
+    for argv in (
+        ["in.pdf", "--margin", "-1"],
+        ["in.pdf", "--margins", "1", "2", "3", "-4"],
+        ["in.pdf", "--margin", "1", "--margins", "1", "2", "3", "4"],
+    ):
+        with pytest.raises(SystemExit) as exc:
+            p.parse_args(argv)
+        assert exc.value.code == 2
 
 
 @pytest.fixture

@@ -157,15 +157,19 @@ def epub_metadata(doc: "pymupdf.Document") -> dict:
 
 def render_page(page: "pymupdf.Page", resolution: int | None = None,
                 clip: "pymupdf.Rect | None" = None,
-                transparent_background: bool = False) -> bytes:
+                transparent_background: bool = False,
+                margins: "tuple[int, int, int, int] | None" = None) -> bytes:
     """Render one PDF page to a PNG byte string.
 
     *resolution*, when given, is the target width in pixels; the height is
     scaled proportionally. *clip*, when given, is a ``Rect`` in page
     coordinates to render only that region (e.g. with margins trimmed).
+    *margins* is an optional ``(top, right, bottom, left)`` tuple specifying
+    padding in output pixels, applied after rendering and scaling.
     Unpainted page areas are white by default; set *transparent_background*
-    to preserve them as transparent PNG pixels.
+    to preserve them, including added margins, as transparent PNG pixels.
     """
+    margins = _validate_margins(margins)
     rect = clip if clip is not None else page.rect
     if resolution is not None:
         if resolution <= 0:
@@ -177,7 +181,41 @@ def render_page(page: "pymupdf.Page", resolution: int | None = None,
     if clip is not None:
         kwargs["clip"] = clip
     pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), **kwargs)
+    if any(margins):
+        top, right, bottom, left = margins
+        padded = pymupdf.Pixmap(
+            pix.colorspace,
+            pymupdf.IRect(0, 0, pix.width + left + right, pix.height + top + bottom),
+            pix.alpha,
+        )
+        if transparent_background:
+            padded.clear_with()
+        else:
+            padded.clear_with(255)
+        pix.set_origin(left, top)
+        padded.copy(pix, pix.irect)
+        pix = padded
     return pix.tobytes("png")
+
+
+def _validate_margins(
+    margins: "tuple[int, int, int, int] | None",
+) -> tuple[int, int, int, int]:
+    """Return validated ``(top, right, bottom, left)`` pixel margins."""
+    if margins is None:
+        return (0, 0, 0, 0)
+    try:
+        values = tuple(margins)
+    except TypeError as exc:
+        raise ConversionError(
+            "margins must contain top, right, bottom and left values"
+        ) from exc
+    if len(values) != 4:
+        raise ConversionError("margins must contain top, right, bottom and left values")
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+           for value in values):
+        raise ConversionError("margins must be integers greater than or equal to 0")
+    return values
 
 
 class _EpubWriter:
@@ -409,7 +447,8 @@ def convert(input_path: Path, output_path: Path | None = None,
             resolution: int | None = None, crop: str | None = None,
             cover: bool = True, log=None, progress=None,
             epub2: bool = False,
-            transparent_background: bool = False) -> Path:
+            transparent_background: bool = False,
+            margins: "tuple[int, int, int, int] | None" = None) -> Path:
     """Convert *input_path* (a PDF) to an EPUB and return the output path.
 
     Every PDF page is rendered to a PNG and placed in its own EPUB section in
@@ -418,6 +457,9 @@ def convert(input_path: Path, output_path: Path | None = None,
     render width in pixels. *crop*, when given, trims white margins:
     ``"global"`` uses one common inset for all pages, ``"page"`` trims each
     page to its own content.
+
+    *margins*, when given, contains the top, right, bottom and left padding
+    to add in output pixels after each page is rendered.
 
     When *cover* is true (the default) the first page also becomes the book's
     cover image. EPUB 3 fixed-layout output is the default; when *epub2* is
@@ -431,6 +473,7 @@ def convert(input_path: Path, output_path: Path | None = None,
     """
     if crop is not None and crop not in ("global", "page"):
         raise ConversionError(f"crop must be 'global' or 'page', got {crop!r}")
+    margins = _validate_margins(margins)
 
     def _log(message: str) -> None:
         if log is not None:
@@ -483,6 +526,8 @@ def convert(input_path: Path, output_path: Path | None = None,
         else:
             _log(f"output:  {output_path}  (native resolution)")
         _log(f"format:  EPUB {2 if epub2 else 3}")
+        if any(margins):
+            _log(f"margins: {margins[0]} {margins[1]} {margins[2]} {margins[3]} px")
         if crop is not None:
             trimmed = sum(
                 1 for p, c in zip(pages_list, clips) if c is not None and c != p.rect
@@ -495,6 +540,7 @@ def convert(input_path: Path, output_path: Path | None = None,
             png = render_page(
                 page, resolution, clip,
                 transparent_background=transparent_background,
+                margins=margins,
             )
             rendered.append((f"page-{i + 1:04d}.png", png))
             _progress(i + 1, page_count)

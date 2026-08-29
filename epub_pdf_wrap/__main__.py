@@ -9,6 +9,13 @@ from . import __version__
 from .core import ConversionError, convert
 
 
+def _non_negative_int(value: str) -> int:
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be an integer greater than or equal to 0")
+    return number
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="epub-pdf-wrap",
@@ -30,6 +37,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-r", "--resolution", type=int,
         help="target render width in pixels for the output (default: input resolution)",
+    )
+    margin = parser.add_mutually_exclusive_group()
+    margin.add_argument(
+        "--margin", type=_non_negative_int, metavar="PIXELS",
+        help="add the same margin in pixels to every side of each page",
+    )
+    margin.add_argument(
+        "--margins", type=_non_negative_int, nargs=4,
+        metavar=("TOP", "RIGHT", "BOTTOM", "LEFT"),
+        help="add top, right, bottom and left margins in pixels",
     )
     crop = parser.add_mutually_exclusive_group()
     crop.add_argument(
@@ -70,6 +87,8 @@ def _progress(done: int, total: int) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     crop = "global" if args.crop_global else ("page" if args.crop_page else None)
+    margins = ((args.margin,) * 4 if args.margin is not None
+               else tuple(args.margins) if args.margins is not None else None)
     try:
         out = convert(
             args.input,
@@ -79,6 +98,7 @@ def main(argv: list[str] | None = None) -> int:
             cover=not args.nocover,
             epub2=args.epub2,
             transparent_background=args.transparent_background,
+            margins=margins,
             log=lambda line: print(line),
             progress=_progress,
         )
