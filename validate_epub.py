@@ -66,6 +66,24 @@ try:
         elif "OEBPS/nav.xhtml" in z.namelist():
             errors += 1
             print("PACKAGE ERROR: EPUB 2 unexpectedly contains an EPUB 3 nav")
+        for image in opf.findall("opf:manifest/opf:item", opf_ns):
+            media_type = image.get("media-type")
+            if media_type not in ("image/png", "image/jpeg"):
+                continue
+            image_path = f"OEBPS/{image.get('href')}"
+            if image_path not in z.namelist():
+                errors += 1
+                print("PACKAGE ERROR: manifest image is missing:", image_path)
+                continue
+            data = z.read(image_path)
+            expected = (
+                data.startswith(b"\x89PNG\r\n\x1a\n")
+                if media_type == "image/png"
+                else data.startswith(b"\xff\xd8") and data.endswith(b"\xff\xd9")
+            )
+            if not expected:
+                errors += 1
+                print("PACKAGE ERROR: image data does not match media type:", image_path)
         for name in z.namelist():
             if name.endswith((".opf", ".xhtml", ".ncx", "container.xml")):
                 try:

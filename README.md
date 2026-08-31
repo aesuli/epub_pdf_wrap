@@ -35,6 +35,11 @@ replaced by the `epub` extension. Running without `pip install` also works via
 - `-r <num>, --resolution <num>`: target render width in pixels for the pages
   in the output file. By default the pages are rendered at the resolution the
   PDF itself declares.
+- `--image-format <png|jpeg|auto>`: page image format (default: `png`). `jpeg`
+  usually makes scans and photographic pages much smaller. `auto` tries both
+  formats per page, keeping lossless PNG when it is no more than 10% larger
+  than JPEG and using JPEG otherwise.
+- `--quality <1-100>`: JPEG quality used by `jpeg` and `auto` (default: `85`).
 - `--margin <pixels>`: add a uniform margin to every side of each rendered
   page. The value must be an integer greater than or equal to zero.
 - `--margins <top> <right> <bottom> <left>`: add a separate margin to each
@@ -72,6 +77,17 @@ Convert a paper at a wider resolution and name the output explicitly:
 ```
 epub-pdf-wrap paper.pdf -o paper.epub -r 1400
 ```
+
+Make a scan substantially smaller with JPEG, or choose the smaller suitable
+format separately for each page:
+
+```
+epub-pdf-wrap scan.pdf --image-format jpeg --quality 85
+epub-pdf-wrap mixed.pdf --image-format auto --quality 85
+```
+
+JPEG cannot preserve transparency. Use PNG or auto with
+`--transparent-background`; auto will select PNG for every transparent page.
 
 Add 20 pixels around every side, or use different values for each side:
 

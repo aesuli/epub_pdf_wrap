@@ -6,13 +6,20 @@ import argparse
 import sys
 
 from . import __version__
-from .core import ConversionError, convert
+from .core import DEFAULT_JPEG_QUALITY, IMAGE_FORMATS, ConversionError, convert
 
 
 def _non_negative_int(value: str) -> int:
     number = int(value)
     if number < 0:
         raise argparse.ArgumentTypeError("must be an integer greater than or equal to 0")
+    return number
+
+
+def _jpeg_quality(value: str) -> int:
+    number = int(value)
+    if not 1 <= number <= 100:
+        raise argparse.ArgumentTypeError("must be an integer from 1 to 100")
     return number
 
 
@@ -37,6 +44,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-r", "--resolution", type=int,
         help="target render width in pixels for the output (default: input resolution)",
+    )
+    parser.add_argument(
+        "--image-format", choices=IMAGE_FORMATS, default="png",
+        help=(
+            "page image format: png, jpeg, or auto (default: png; auto keeps "
+            "PNG when close in size and otherwise uses JPEG)"
+        ),
+    )
+    parser.add_argument(
+        "--quality", type=_jpeg_quality, default=DEFAULT_JPEG_QUALITY,
+        metavar="1-100",
+        help=(
+            f"JPEG quality for --image-format jpeg or auto "
+            f"(default: {DEFAULT_JPEG_QUALITY})"
+        ),
     )
     margin = parser.add_mutually_exclusive_group()
     margin.add_argument(
@@ -99,6 +121,8 @@ def main(argv: list[str] | None = None) -> int:
             epub2=args.epub2,
             transparent_background=args.transparent_background,
             margins=margins,
+            image_format=args.image_format,
+            quality=args.quality,
             log=lambda line: print(line),
             progress=_progress,
         )

@@ -5,7 +5,15 @@ from pathlib import Path
 import pymupdf
 import pytest
 
-from epub_pdf_wrap.core import ConversionError, convert, format_size, page_clip_rect, render_page, slugify
+from epub_pdf_wrap.core import (
+    ConversionError,
+    _encode_pixmap,
+    convert,
+    format_size,
+    page_clip_rect,
+    render_page,
+    slugify,
+)
 
 
 @pytest.fixture
@@ -189,6 +197,143 @@ def test_resolution_flag(tmp_path: Path, tiny_pdf: Path) -> None:
     # IHDR: width at bytes 16..20
     width = struct.unpack(">I", png[16:20])[0]
     assert width == 600
+
+
+def test_jpeg_images_cover_and_manifest(tmp_path: Path, tiny_pdf: Path) -> None:
+    import zipfile
+
+    out = convert(
+        tiny_pdf,
+        tmp_path / "jpeg.epub",
+        image_format="jpeg",
+        quality=72,
+    )
+    with zipfile.ZipFile(out) as z:
+        names = z.namelist()
+        page = z.read("OEBPS/images/page-0001.jpg")
+        cover = z.read("OEBPS/images/cover.jpg")
+        opf = z.read("OEBPS/content.opf").decode("utf-8")
+        xhtml = z.read("OEBPS/page-0001.xhtml").decode("utf-8")
+
+    assert page[:2] == b"\xff\xd8" and page[-2:] == b"\xff\xd9"
+    assert cover == page
+    assert "OEBPS/images/page-0001.png" not in names
+    assert (
+        '<item id="img-0001" media-type="image/jpeg" '
+        'href="images/page-0001.jpg"/>'
+    ) in opf
+    assert (
+        '<item id="cover" media-type="image/jpeg" '
+        'properties="cover-image" href="images/cover.jpg"/>'
+    ) in opf
+    assert '<meta name="viewport" content="width=200, height=260"/>' in xhtml
+    assert '<img src="images/page-0001.jpg"' in xhtml
+
+
+def test_epub2_accepts_jpeg_pages_and_cover(tmp_path: Path, tiny_pdf: Path) -> None:
+    import ebooklib
+    from ebooklib import epub
+    import zipfile
+
+    out = convert(
+        tiny_pdf,
+        tmp_path / "jpeg-epub2.epub",
+        image_format="jpeg",
+        epub2=True,
+    )
+    with zipfile.ZipFile(out) as z:
+        opf = z.read("OEBPS/content.opf").decode("utf-8")
+        assert '<meta name="cover" content="cover"/>' in opf
+        assert (
+            '<item id="cover" media-type="image/jpeg" '
+            'href="images/cover.jpg"/>'
+        ) in opf
+
+    book = epub.read_epub(str(out))
+    images = {item.get_name() for item in book.get_items_of_type(ebooklib.ITEM_IMAGE)}
+    assert images == {
+        "images/cover.jpg",
+        "images/page-0001.jpg",
+        "images/page-0002.jpg",
+    }
+
+
+def test_jpeg_quality_changes_encoded_size() -> None:
+    doc = pymupdf.open()
+    page = doc.new_page(width=160, height=120)
+    for x in range(0, 160, 4):
+        color = (x / 160, ((x * 7) % 160) / 160, ((x * 13) % 160) / 160)
+        page.draw_rect(
+            pymupdf.Rect(x, 0, x + 4, 120),
+            color=color,
+            fill=color,
+            width=0,
+        )
+    try:
+        low = render_page(page, image_format="jpeg", quality=20)
+        high = render_page(page, image_format="jpeg", quality=95)
+    finally:
+        doc.close()
+
+    assert low[:2] == high[:2] == b"\xff\xd8"
+    assert len(low) < len(high)
+
+
+def test_auto_prefers_png_when_close_in_size_and_jpeg_when_clearly_smaller() -> None:
+    class FakePixmap:
+        alpha = 0
+
+        def __init__(self, png_size: int, jpeg_size: int):
+            self.png_size = png_size
+            self.jpeg_size = jpeg_size
+
+        def tobytes(self, output: str, jpg_quality: int = 0) -> bytes:
+            if output == "png":
+                return b"p" * self.png_size
+            assert jpg_quality == 85
+            return b"j" * self.jpeg_size
+
+    assert _encode_pixmap(FakePixmap(109, 100), "auto", 85).startswith(b"p")
+    assert _encode_pixmap(FakePixmap(111, 100), "auto", 85).startswith(b"j")
+
+
+def test_auto_preserves_transparency_as_png() -> None:
+    doc = pymupdf.open()
+    page = doc.new_page(width=20, height=20)
+    try:
+        data = render_page(
+            page,
+            transparent_background=True,
+            image_format="auto",
+        )
+    finally:
+        doc.close()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+@pytest.mark.parametrize(
+    ("image_format", "quality"),
+    [("webp", 85), ("jpeg", 0), ("jpeg", 101), ("jpeg", 1.5), ("jpeg", True)],
+)
+def test_invalid_image_options_raise(
+    tiny_pdf: Path, image_format, quality
+) -> None:
+    with pytest.raises(ConversionError):
+        convert(tiny_pdf, image_format=image_format, quality=quality)
+
+
+def test_jpeg_rejects_transparent_background() -> None:
+    doc = pymupdf.open()
+    page = doc.new_page(width=20, height=20)
+    try:
+        with pytest.raises(ConversionError, match="transparent"):
+            render_page(
+                page,
+                image_format="jpeg",
+                transparent_background=True,
+            )
+    finally:
+        doc.close()
 
 
 def test_margins_add_exact_output_pixels(tmp_path: Path, tiny_pdf: Path) -> None:
@@ -485,12 +630,33 @@ def test_cli_parser_crop_flags() -> None:
     assert args.nocover is False
     assert args.epub2 is False
     assert args.transparent_background is False
+    assert args.image_format == "png"
+    assert args.quality == 85
     args = p.parse_args(["in.pdf", "--nocover"])
     assert args.nocover is True
     args = p.parse_args(["in.pdf", "--epub2"])
     assert args.epub2 is True
     args = p.parse_args(["in.pdf", "--transparent-background"])
     assert args.transparent_background is True
+
+
+def test_cli_parser_image_options() -> None:
+    from epub_pdf_wrap.__main__ import build_parser
+
+    p = build_parser()
+    args = p.parse_args(
+        ["in.pdf", "--image-format", "auto", "--quality", "73"]
+    )
+    assert args.image_format == "auto"
+    assert args.quality == 73
+    for argv in (
+        ["in.pdf", "--image-format", "webp"],
+        ["in.pdf", "--quality", "0"],
+        ["in.pdf", "--quality", "101"],
+    ):
+        with pytest.raises(SystemExit) as exc:
+            p.parse_args(argv)
+        assert exc.value.code == 2
 
 
 def test_cli_parser_margin_flags() -> None:

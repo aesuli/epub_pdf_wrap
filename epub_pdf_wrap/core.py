@@ -15,6 +15,15 @@ from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 import pymupdf
 
 
+IMAGE_FORMATS = ("png", "jpeg", "auto")
+DEFAULT_JPEG_QUALITY = 85
+
+# In auto mode, prefer lossless PNG when it costs no more than 10% over JPEG.
+# This keeps crisp line art lossless without retaining very large PNGs for
+# photographic or noisy scanned pages.
+_AUTO_PNG_SIZE_RATIO = 1.10
+
+
 class ConversionError(RuntimeError):
     """Raised when the PDF cannot be read or rendered."""
 
@@ -155,11 +164,43 @@ def epub_metadata(doc: "pymupdf.Document") -> dict:
     return out
 
 
+def _validate_image_options(image_format: str, quality: int) -> tuple[str, int]:
+    """Return validated image format and JPEG quality options."""
+    if image_format not in IMAGE_FORMATS:
+        expected = ", ".join(repr(value) for value in IMAGE_FORMATS)
+        raise ConversionError(
+            f"image_format must be one of {expected}, got {image_format!r}"
+        )
+    if (
+        isinstance(quality, bool)
+        or not isinstance(quality, int)
+        or not 1 <= quality <= 100
+    ):
+        raise ConversionError(f"quality must be an integer from 1 to 100, got {quality!r}")
+    return image_format, quality
+
+
+def _encode_pixmap(pix: "pymupdf.Pixmap", image_format: str, quality: int) -> bytes:
+    """Encode *pix* according to the already validated image options."""
+    if image_format == "png":
+        return pix.tobytes("png")
+    if image_format == "jpeg":
+        return pix.tobytes("jpeg", jpg_quality=quality)
+
+    png = pix.tobytes("png")
+    if pix.alpha:
+        return png
+    jpeg = pix.tobytes("jpeg", jpg_quality=quality)
+    return png if len(png) <= len(jpeg) * _AUTO_PNG_SIZE_RATIO else jpeg
+
+
 def render_page(page: "pymupdf.Page", resolution: int | None = None,
                 clip: "pymupdf.Rect | None" = None,
                 transparent_background: bool = False,
-                margins: "tuple[int, int, int, int] | None" = None) -> bytes:
-    """Render one PDF page to a PNG byte string.
+                margins: "tuple[int, int, int, int] | None" = None,
+                image_format: str = "png",
+                quality: int = DEFAULT_JPEG_QUALITY) -> bytes:
+    """Render one PDF page to a PNG or JPEG byte string.
 
     *resolution*, when given, is the target width in pixels; the height is
     scaled proportionally. *clip*, when given, is a ``Rect`` in page
@@ -168,8 +209,14 @@ def render_page(page: "pymupdf.Page", resolution: int | None = None,
     padding in output pixels, applied after rendering and scaling.
     Unpainted page areas are white by default; set *transparent_background*
     to preserve them, including added margins, as transparent PNG pixels.
+    *image_format* may be ``"png"``, ``"jpeg"`` or ``"auto"``. Auto encodes
+    both formats and keeps lossless PNG when it is no more than 10% larger;
+    otherwise it uses JPEG. *quality* is the JPEG quality from 1 to 100.
     """
     margins = _validate_margins(margins)
+    image_format, quality = _validate_image_options(image_format, quality)
+    if transparent_background and image_format == "jpeg":
+        raise ConversionError("JPEG does not support a transparent background")
     rect = clip if clip is not None else page.rect
     if resolution is not None:
         if resolution <= 0:
@@ -195,7 +242,7 @@ def render_page(page: "pymupdf.Page", resolution: int | None = None,
         pix.set_origin(left, top)
         padded.copy(pix, pix.irect)
         pix = padded
-    return pix.tobytes("png")
+    return _encode_pixmap(pix, image_format, quality)
 
 
 def _validate_margins(
@@ -218,8 +265,73 @@ def _validate_margins(
     return values
 
 
+def _jpeg_dimensions(data: bytes) -> tuple[int, int]:
+    """Read JPEG dimensions from its start-of-frame segment."""
+    if len(data) < 4 or data[:2] != b"\xff\xd8":
+        raise ValueError("missing JPEG start marker")
+    start_of_frame = {
+        0xC0, 0xC1, 0xC2, 0xC3,
+        0xC5, 0xC6, 0xC7,
+        0xC9, 0xCA, 0xCB,
+        0xCD, 0xCE, 0xCF,
+    }
+    pos = 2
+    while pos < len(data):
+        while pos < len(data) and data[pos] != 0xFF:
+            pos += 1
+        while pos < len(data) and data[pos] == 0xFF:
+            pos += 1
+        if pos >= len(data):
+            break
+        marker = data[pos]
+        pos += 1
+        if marker in (0x01, 0xD8, 0xD9):
+            continue
+        if marker == 0xDA or pos + 2 > len(data):
+            break
+        segment_length = struct.unpack(">H", data[pos:pos + 2])[0]
+        if segment_length < 2 or pos + segment_length > len(data):
+            break
+        if marker in start_of_frame:
+            if segment_length < 7:
+                break
+            height, width = struct.unpack(">HH", data[pos + 3:pos + 7])
+            if width and height:
+                return width, height
+            break
+        pos += segment_length
+    raise ValueError("missing JPEG dimensions")
+
+
+def _image_info(name: str, data: bytes) -> tuple[str, str, int, int]:
+    """Return extension, media type, width and height for PNG/JPEG data."""
+    if (
+        len(data) >= 24
+        and data[:8] == b"\x89PNG\r\n\x1a\n"
+        and data[12:16] == b"IHDR"
+    ):
+        extension = "png"
+        media_type = "image/png"
+        width, height = struct.unpack(">II", data[16:24])
+    elif data[:2] == b"\xff\xd8":
+        extension = "jpg"
+        media_type = "image/jpeg"
+        try:
+            width, height = _jpeg_dimensions(data)
+        except ValueError as exc:
+            raise ConversionError(f"page image is not a valid JPEG: {name}") from exc
+    else:
+        raise ConversionError(f"page image is not a valid PNG or JPEG: {name}")
+
+    suffix = Path(name).suffix.lower()
+    expected_suffixes = {".png"} if extension == "png" else {".jpg", ".jpeg"}
+    if suffix and suffix not in expected_suffixes:
+        raise ConversionError(f"page image extension does not match its data: {name}")
+    return extension, media_type, width, height
+
+
 class _EpubWriter:
-    """Minimal EPUB writer: one XHTML section per page, one PNG per page.
+    """Minimal EPUB writer: one XHTML section and one image per page.
 
     The spine is built from the XHTML sections (never directly from images),
     which strict readers require.
@@ -301,16 +413,20 @@ class _EpubWriter:
                 for i, sid in enumerate(self._section_ids, start=1)
             )
             + "".join(
-                f'<item id="img-{i:04d}" media-type="image/png" '
+                f'<item id="img-{i:04d}" media-type="{_image_info(name, data)[1]}" '
                 f'href="images/{name}"/>'
-                for i, name in enumerate(self.image_names, start=1)
+                for i, (name, data) in enumerate(
+                    zip(self.image_names, self.images), start=1
+                )
             )
         )
         if self.cover is not None:
+            cover_name, cover_data = self.cover
+            cover_media_type = _image_info(cover_name, cover_data)[1]
             properties = "" if self.epub2 else ' properties="cover-image"'
             manifest += (
-                f'<item id="cover" media-type="image/png"{properties} '
-                'href="images/cover.png"/>'
+                f'<item id="cover" media-type="{cover_media_type}"{properties} '
+                f'href="images/{cover_name}"/>'
             )
         spine = "".join(
             f'<itemref idref="{sid}"/>' for sid in self._section_ids
@@ -366,13 +482,7 @@ class _EpubWriter:
         )
 
     def _section_xhtml(self, index: int, name: str, data: bytes) -> str:
-        if (
-            len(data) < 24
-            or data[:8] != b"\x89PNG\r\n\x1a\n"
-            or data[12:16] != b"IHDR"
-        ):
-            raise ConversionError(f"page image is not a valid PNG: {name}")
-        width, height = struct.unpack(">II", data[16:24])
+        _, _, width, height = _image_info(name, data)
         if self.epub2:
             css = (
                 "html,body,.page{margin:0;padding:0;width:100%;}"
@@ -427,7 +537,7 @@ class _EpubWriter:
             for name, data in zip(self.image_names, self.images):
                 z.writestr(f"OEBPS/images/{name}", data)
             if self.cover is not None:
-                z.writestr("OEBPS/images/cover.png", self.cover[1])
+                z.writestr(f"OEBPS/images/{self.cover[0]}", self.cover[1])
 
         self._tmp.write_bytes(buf.getvalue())
         self._tmp.replace(self.path)
@@ -448,11 +558,13 @@ def convert(input_path: Path, output_path: Path | None = None,
             cover: bool = True, log=None, progress=None,
             epub2: bool = False,
             transparent_background: bool = False,
-            margins: "tuple[int, int, int, int] | None" = None) -> Path:
+            margins: "tuple[int, int, int, int] | None" = None,
+            image_format: str = "png",
+            quality: int = DEFAULT_JPEG_QUALITY) -> Path:
     """Convert *input_path* (a PDF) to an EPUB and return the output path.
 
-    Every PDF page is rendered to a PNG and placed in its own EPUB section in
-    document order. The output file defaults to the input name with the
+    Every PDF page is rendered to an image and placed in its own EPUB section
+    in document order. The output file defaults to the input name with the
     extension swapped to ``.epub``. *resolution*, when given, is the target
     render width in pixels. *crop*, when given, trims white margins:
     ``"global"`` uses one common inset for all pages, ``"page"`` trims each
@@ -467,6 +579,10 @@ def convert(input_path: Path, output_path: Path | None = None,
     Unpainted page areas are rendered white unless *transparent_background*
     is true.
 
+    *image_format* may be ``"png"`` (the lossless default), ``"jpeg"`` or
+    ``"auto"``. Auto keeps PNG when it is no more than 10% larger than JPEG,
+    otherwise it uses JPEG. *quality* controls JPEG encoding from 1 to 100.
+
     *log* (optional callable(str)) receives descriptive lines (input info,
     output result). *progress* (optional callable(done, total)) is called for
     every rendered page.
@@ -474,6 +590,9 @@ def convert(input_path: Path, output_path: Path | None = None,
     if crop is not None and crop not in ("global", "page"):
         raise ConversionError(f"crop must be 'global' or 'page', got {crop!r}")
     margins = _validate_margins(margins)
+    image_format, quality = _validate_image_options(image_format, quality)
+    if transparent_background and image_format == "jpeg":
+        raise ConversionError("JPEG does not support a transparent background")
 
     def _log(message: str) -> None:
         if log is not None:
@@ -526,6 +645,10 @@ def convert(input_path: Path, output_path: Path | None = None,
         else:
             _log(f"output:  {output_path}  (native resolution)")
         _log(f"format:  EPUB {2 if epub2 else 3}")
+        image_description = image_format.upper()
+        if image_format in ("jpeg", "auto"):
+            image_description += f" (JPEG quality {quality})"
+        _log(f"images:  {image_description}")
         if any(margins):
             _log(f"margins: {margins[0]} {margins[1]} {margins[2]} {margins[3]} px")
         if crop is not None:
@@ -537,19 +660,27 @@ def convert(input_path: Path, output_path: Path | None = None,
         rendered: list[tuple[str, bytes]] = []
         for i, (page, clip_raw) in enumerate(zip(pages_list, clips)):
             clip = None if (clip_raw is None or clip_raw == page.rect) else clip_raw
-            png = render_page(
+            data = render_page(
                 page, resolution, clip,
                 transparent_background=transparent_background,
                 margins=margins,
+                image_format=image_format,
+                quality=quality,
             )
-            rendered.append((f"page-{i + 1:04d}.png", png))
+            extension = _image_info("", data)[0]
+            rendered.append((f"page-{i + 1:04d}.{extension}", data))
             _progress(i + 1, page_count)
+        if image_format == "auto":
+            png_count = sum(name.endswith(".png") for name, _ in rendered)
+            jpeg_count = page_count - png_count
+            _log(f"selected: {png_count} PNG, {jpeg_count} JPEG")
     finally:
         doc.close()
 
     pages = rendered
 
-    cover_data = ("cover.png", pages[0][1]) if cover else None
+    first_extension = Path(pages[0][0]).suffix
+    cover_data = (f"cover{first_extension}", pages[0][1]) if cover else None
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     writer = _EpubWriter(output_path, metadata, cover=cover_data, epub2=epub2)
