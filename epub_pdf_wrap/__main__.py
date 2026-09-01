@@ -43,13 +43,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "-r", "--resolution", type=int,
-        help="target render width in pixels for the output (default: input resolution)",
+        help=(
+            "target output width in pixels; explicitly resamples extracted "
+            "MRC images (default: preserve their native pixels)"
+        ),
     )
     parser.add_argument(
-        "--image-format", choices=IMAGE_FORMATS, default="png",
+        "--pages", metavar="SELECTION",
         help=(
-            "page image format: png, jpeg, or auto (default: png; auto keeps "
-            "PNG when close in size and otherwise uses JPEG)"
+            "pages to include, as numbers and inclusive ranges "
+            "(for example: 2,3,5-10,21)"
+        ),
+    )
+    parser.add_argument(
+        "--image-format", choices=IMAGE_FORMATS,
+        help=(
+            "page image format: png, jpeg, or auto (default: PNG for rendered "
+            "pages; --mrc-extract preserves compatible source images and "
+            "losslessly converts unsupported codecs to PNG)"
         ),
     )
     parser.add_argument(
@@ -58,6 +69,20 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             f"JPEG quality for --image-format jpeg or auto "
             f"(default: {DEFAULT_JPEG_QUALITY})"
+        ),
+    )
+    parser.add_argument(
+        "--mrc", action="store_true",
+        help=(
+            "split every rendered page into Mixed Raster Content background, "
+            "foreground and selector layers"
+        ),
+    )
+    parser.add_argument(
+        "--mrc-extract", action="store_true",
+        help=(
+            "extract compatible existing PDF MRC image layers into layered "
+            "EPUB pages; other pages are rendered and honor --mrc"
         ),
     )
     margin = parser.add_mutually_exclusive_group()
@@ -123,6 +148,9 @@ def main(argv: list[str] | None = None) -> int:
             margins=margins,
             image_format=args.image_format,
             quality=args.quality,
+            mrc=args.mrc,
+            mrc_extract=args.mrc_extract,
+            pages=args.pages,
             log=lambda line: print(line),
             progress=_progress,
         )

@@ -84,6 +84,53 @@ try:
             if not expected:
                 errors += 1
                 print("PACKAGE ERROR: image data does not match media type:", image_path)
+            if media_type == "image/png" and len(data) >= 26:
+                bit_depth, color_type = data[24], data[25]
+                valid_depths = {
+                    0: {1, 2, 4, 8, 16},
+                    2: {8, 16},
+                    3: {1, 2, 4, 8},
+                    4: {8, 16},
+                    6: {8, 16},
+                }
+                if bit_depth not in valid_depths.get(color_type, set()):
+                    errors += 1
+                    print(
+                        "PACKAGE ERROR: invalid PNG bit depth/color type:",
+                        image_path,
+                        bit_depth,
+                        color_type,
+                    )
+        # Every page XHTML document may reference one image (normal output),
+        # several stacked XHTML images, or SVG images plus an MRC selector.
+        # Ensure all references resolve inside the EPUB container.
+        for name in z.namelist():
+            if not name.startswith("OEBPS/page-") or not name.endswith(".xhtml"):
+                continue
+            try:
+                document = ET.fromstring(z.read(name))
+            except ET.ParseError:
+                continue
+            for image in document.iter("{http://www.w3.org/1999/xhtml}img"):
+                src = image.get("src")
+                if not src or src.startswith(("/", "#")) or "://" in src:
+                    errors += 1
+                    print("CONTENT ERROR: invalid page image reference:", name, src)
+                    continue
+                image_path = str(Path(name).parent / src).replace("\\", "/")
+                if image_path not in z.namelist():
+                    errors += 1
+                    print("CONTENT ERROR: page image is missing:", image_path)
+            for image in document.iter("{http://www.w3.org/2000/svg}image"):
+                src = image.get("{http://www.w3.org/1999/xlink}href")
+                if not src or src.startswith(("/", "#")) or "://" in src:
+                    errors += 1
+                    print("CONTENT ERROR: invalid SVG image reference:", name, src)
+                    continue
+                image_path = str(Path(name).parent / src).replace("\\", "/")
+                if image_path not in z.namelist():
+                    errors += 1
+                    print("CONTENT ERROR: SVG image is missing:", image_path)
         for name in z.namelist():
             if name.endswith((".opf", ".xhtml", ".ncx", "container.xml")):
                 try:

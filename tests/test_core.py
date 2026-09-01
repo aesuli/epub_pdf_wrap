@@ -7,9 +7,11 @@ import pytest
 
 from epub_pdf_wrap.core import (
     ConversionError,
+    _encode_grayscale_png,
     _encode_pixmap,
     convert,
     format_size,
+    parse_page_selection,
     page_clip_rect,
     render_page,
     slugify,
@@ -279,6 +281,25 @@ def test_jpeg_quality_changes_encoded_size() -> None:
     assert len(low) < len(high)
 
 
+@pytest.mark.parametrize(
+    ("source_bpc", "expected_png_depth"),
+    ((1, 1), (2, 2), (3, 4), (4, 4), (8, 8), (16, 8)),
+)
+def test_grayscale_png_uses_minimal_supported_source_depth(
+    source_bpc: int, expected_png_depth: int
+) -> None:
+    samples = bytes((index * 37) % 256 for index in range(13 * 3))
+    pixmap = pymupdf.Pixmap(pymupdf.csGRAY, 13, 3, samples, False)
+
+    png = _encode_grayscale_png(pixmap, source_bpc)
+    decoded = pymupdf.Pixmap(png)
+
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    assert png[24] == expected_png_depth
+    assert png[25] == 0  # grayscale
+    assert (decoded.width, decoded.height) == (13, 3)
+
+
 def test_auto_prefers_png_when_close_in_size_and_jpeg_when_clearly_smaller() -> None:
     class FakePixmap:
         alpha = 0
@@ -334,6 +355,322 @@ def test_jpeg_rejects_transparent_background() -> None:
             )
     finally:
         doc.close()
+
+
+def test_mrc_extract_writes_layered_page_and_flattened_cover(tmp_path: Path) -> None:
+    import zipfile
+    from random import Random
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=120, height=80)
+    background = pymupdf.Pixmap(
+        pymupdf.csRGB,
+        120,
+        80,
+        bytes([240, 240, 240]) * (120 * 80),
+        False,
+    )
+    foreground_samples = Random(0).randbytes(120 * 80 * 3)
+    foreground = pymupdf.Pixmap(
+        pymupdf.csRGB,
+        120,
+        80,
+        foreground_samples,
+        False,
+    )
+    mask = pymupdf.Pixmap(
+        pymupdf.csGRAY,
+        120,
+        80,
+        bytes([0]) * (120 * 80),
+        False,
+    )
+    mask.set_rect((50, 30, 70, 50), (255,))
+    page.insert_image(page.rect, pixmap=background)
+    page.insert_image(
+        page.rect,
+        stream=foreground.tobytes("png"),
+        mask=_encode_grayscale_png(mask, 1),
+    )
+    source = tmp_path / "mrc.pdf"
+    doc.save(str(source))
+    doc.close()
+
+    out = convert(
+        source,
+        tmp_path / "mrc.epub",
+        resolution=120,
+        image_format="jpeg",
+        mrc_extract=True,
+    )
+    with zipfile.ZipFile(out) as z:
+        names = z.namelist()
+        opf = z.read("OEBPS/content.opf").decode("utf-8")
+        xhtml = z.read("OEBPS/page-0001.xhtml").decode("utf-8")
+        background_data = z.read("OEBPS/images/page-0001-background.jpg")
+        foreground_data = z.read("OEBPS/images/page-0001-foreground.jpg")
+        mask_data = z.read("OEBPS/images/page-0001-mask.png")
+        cover_data = z.read("OEBPS/images/cover.jpg")
+
+    assert "OEBPS/images/page-0001-background.jpg" in names
+    assert "OEBPS/images/page-0001-foreground.jpg" in names
+    assert "OEBPS/images/page-0001-mask.png" in names
+    assert "OEBPS/images/page-0001.jpg" not in names
+    assert '<item id="img-0001-01" media-type="image/jpeg"' in opf
+    assert '<item id="img-0001-02" media-type="image/jpeg"' in opf
+    assert '<item id="img-0001-03" media-type="image/png"' in opf
+    assert '<item id="cover" media-type="image/jpeg"' in opf
+    assert xhtml.count("<image ") == 3
+    assert '<mask id="mrc-selector"' in xhtml
+    assert 'mask="url(#mrc-selector)"' in xhtml
+    assert '<meta name="viewport" content="width=120, height=80"/>' in xhtml
+    assert background_data[:2] == b"\xff\xd8"
+    assert foreground_data[:2] == b"\xff\xd8"
+    assert mask_data[:8] == b"\x89PNG\r\n\x1a\n"
+    assert mask_data[24] == 1
+    assert mask_data[25] == 0
+    assert set(pymupdf.Pixmap(mask_data).samples) <= {0, 255}
+    assert len(foreground_data) < len(foreground_samples)
+    assert cover_data[:2] == b"\xff\xd8"
+
+    epub2_out = convert(
+        source,
+        tmp_path / "mrc-epub2.epub",
+        resolution=120,
+        image_format="jpeg",
+        mrc_extract=True,
+        epub2=True,
+        cover=False,
+    )
+    with zipfile.ZipFile(epub2_out) as z:
+        epub2_names = z.namelist()
+        epub2_xhtml = z.read("OEBPS/page-0001.xhtml").decode("utf-8")
+    assert "OEBPS/images/page-0001-background.jpg" in epub2_names
+    assert "OEBPS/images/page-0001-foreground.png" in epub2_names
+    assert "OEBPS/images/page-0001-mask.png" not in epub2_names
+    assert epub2_xhtml.count("<img ") == 2
+    assert "<svg " not in epub2_xhtml
+
+
+def test_mrc_extract_falls_back_for_non_mrc_pages(
+    tmp_path: Path, tiny_pdf: Path
+) -> None:
+    logs: list[str] = []
+    out = convert(
+        tiny_pdf,
+        tmp_path / "fallback.epub",
+        mrc_extract=True,
+        log=logs.append,
+    )
+    import zipfile
+
+    with zipfile.ZipFile(out) as z:
+        assert "OEBPS/images/page-0001.png" in z.namelist()
+        assert "OEBPS/images/foreground.png" not in z.namelist()
+    assert "mrc:     extracted 0 of 2 pages" in logs
+
+
+def test_mrc_extract_reuses_native_resources_geometry_depth_and_ocr(
+    tmp_path: Path,
+) -> None:
+    import zipfile
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=120, height=80)
+    background = pymupdf.Pixmap(
+        pymupdf.csRGB,
+        60,
+        40,
+        bytes([220, 210, 200]) * (60 * 40),
+        False,
+    )
+    foreground = pymupdf.Pixmap(
+        pymupdf.csRGB,
+        120,
+        80,
+        bytes([30, 20, 10]) * (120 * 80),
+        False,
+    )
+    mask = pymupdf.Pixmap(
+        pymupdf.csGRAY,
+        120,
+        80,
+        bytes([0]) * (120 * 80),
+        False,
+    )
+    mask.set_rect((15, 20, 105, 35), (255,))
+    page.insert_image(page.rect, stream=background.tobytes("jpeg", jpg_quality=83))
+    page.insert_image(
+        page.rect,
+        stream=foreground.tobytes("jpeg", jpg_quality=79),
+        mask=_encode_grayscale_png(mask, 1),
+    )
+    page.insert_text((20, 30), "SEARCHABLE", render_mode=3)
+    source_path = tmp_path / "native-mrc.pdf"
+    doc.save(str(source_path))
+    doc.close()
+
+    source_doc = pymupdf.open(source_path)
+    refs = source_doc[0].get_images(full=True)
+    expected_background = source_doc.extract_image(refs[0][0])["image"]
+    expected_foreground = source_doc.extract_image(refs[1][0])["image"]
+    expected_mask_samples = pymupdf.Pixmap(source_doc, refs[1][1]).samples
+    source_doc.close()
+
+    out = convert(
+        source_path,
+        tmp_path / "native-mrc.epub",
+        mrc_extract=True,
+        cover=False,
+    )
+    with zipfile.ZipFile(out) as z:
+        background_data = z.read("OEBPS/images/page-0001-background.jpg")
+        foreground_data = z.read("OEBPS/images/page-0001-foreground.jpg")
+        mask_data = z.read("OEBPS/images/page-0001-mask.png")
+        xhtml = z.read("OEBPS/page-0001.xhtml").decode("utf-8")
+
+    assert background_data == expected_background
+    assert foreground_data == expected_foreground
+    assert pymupdf.Pixmap(mask_data).samples == expected_mask_samples
+    assert (pymupdf.Pixmap(background_data).width, pymupdf.Pixmap(background_data).height) == (60, 40)
+    assert (pymupdf.Pixmap(foreground_data).width, pymupdf.Pixmap(foreground_data).height) == (120, 80)
+    assert mask_data[24:26] == bytes((1, 0))
+    assert 'viewBox="0 0 120 80"' in xhtml
+    assert '<meta name="viewport" content="width=120, height=80"/>' in xhtml
+    assert "SEARCHABLE" in xhtml
+
+    resized = convert(
+        source_path,
+        tmp_path / "resized-mrc.epub",
+        resolution=90,
+        image_format="png",
+        mrc_extract=True,
+        cover=False,
+    )
+    with zipfile.ZipFile(resized) as z:
+        resized_background = z.read("OEBPS/images/page-0001-background.png")
+        resized_foreground = z.read("OEBPS/images/page-0001-foreground.png")
+        resized_mask = z.read("OEBPS/images/page-0001-mask.png")
+    assert _png_size(resized_background) == (90, 60)
+    assert _png_size(resized_foreground) == (90, 60)
+    assert _png_size(resized_mask) == (90, 60)
+    assert resized_mask[24:26] == bytes((1, 0))
+
+
+def test_mrc_generates_layers_for_rendered_page_and_reconstructs_png(
+    tmp_path: Path,
+) -> None:
+    import zipfile
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=40, height=30)
+    page.draw_rect(
+        pymupdf.Rect(5, 6, 22, 17),
+        color=(0, 0, 0),
+        fill=(0, 0, 0),
+        width=0,
+    )
+    page.draw_rect(
+        pymupdf.Rect(24, 8, 35, 24),
+        color=(0.8, 0.2, 0.1),
+        fill=(0.8, 0.2, 0.1),
+        width=0,
+    )
+    source = tmp_path / "rendered.pdf"
+    expected = pymupdf.Pixmap(render_page(page, resolution=40))
+    doc.save(str(source))
+    doc.close()
+
+    logs: list[str] = []
+    out = convert(
+        source,
+        tmp_path / "rendered-mrc.epub",
+        resolution=40,
+        mrc=True,
+        cover=False,
+        log=logs.append,
+    )
+    with zipfile.ZipFile(out) as z:
+        names = z.namelist()
+        background = pymupdf.Pixmap(
+            z.read("OEBPS/images/page-0001-background.png")
+        )
+        foreground = pymupdf.Pixmap(
+            z.read("OEBPS/images/page-0001-foreground.png")
+        )
+        mask_data = z.read("OEBPS/images/page-0001-mask.png")
+        selector = pymupdf.Pixmap(mask_data)
+        xhtml = z.read("OEBPS/page-0001.xhtml").decode("utf-8")
+
+    assert "OEBPS/images/page-0001.png" not in names
+    assert mask_data[24:26] == bytes((1, 0))
+    assert (background.width, background.height) == (40, 30)
+    assert (foreground.width, foreground.height) == (40, 30)
+    assert (selector.width, selector.height) == (40, 30)
+    assert set(selector.samples) == {0, 255}
+    reconstructed = bytearray()
+    for position, selected in enumerate(selector.samples):
+        source_samples = foreground.samples if selected else background.samples
+        start = position * 3
+        reconstructed.extend(source_samples[start:start + 3])
+    assert bytes(reconstructed) == expected.samples
+    assert '<mask id="mrc-selector"' in xhtml
+    assert '<meta name="viewport" content="width=40, height=30"/>' in xhtml
+    assert "mrc:     generated 1 of 1 pages" in logs
+
+
+def test_mrc_epub2_uses_transparent_foreground_overlay(
+    tmp_path: Path, tiny_pdf: Path
+) -> None:
+    import zipfile
+
+    out = convert(
+        tiny_pdf,
+        tmp_path / "rendered-mrc-epub2.epub",
+        resolution=80,
+        image_format="jpeg",
+        mrc=True,
+        epub2=True,
+        cover=False,
+    )
+    with zipfile.ZipFile(out) as z:
+        names = z.namelist()
+        xhtml = z.read("OEBPS/page-0001.xhtml").decode("utf-8")
+        foreground = z.read("OEBPS/images/page-0001-foreground.png")
+
+    assert "OEBPS/images/page-0001-background.jpg" in names
+    assert "OEBPS/images/page-0001-mask.png" not in names
+    assert foreground[25] == 6  # RGBA PNG
+    assert xhtml.count("<img ") == 2
+    assert "<svg " not in xhtml
+
+
+def test_mrc_and_extract_generate_fallback_pages(
+    tmp_path: Path, tiny_pdf: Path
+) -> None:
+    import zipfile
+
+    logs: list[str] = []
+    out = convert(
+        tiny_pdf,
+        tmp_path / "mrc-fallback.epub",
+        mrc=True,
+        mrc_extract=True,
+        cover=False,
+        log=logs.append,
+    )
+    with zipfile.ZipFile(out) as z:
+        names = z.namelist()
+
+    assert "OEBPS/images/page-0001-background.png" in names
+    assert "OEBPS/images/page-0002-background.png" in names
+    assert "mrc:     extracted 0 of 2 pages" in logs
+    assert "mrc:     generated 2 of 2 pages" in logs
+
+
+def test_mrc_rejects_transparent_background(tiny_pdf: Path) -> None:
+    with pytest.raises(ConversionError, match="transparent"):
+        convert(tiny_pdf, mrc=True, transparent_background=True)
 
 
 def test_margins_add_exact_output_pixels(tmp_path: Path, tiny_pdf: Path) -> None:
@@ -471,6 +808,43 @@ def test_convert_reports_input_info_and_progress(tmp_path: Path, tiny_pdf: Path)
     assert "2 pages" in joined
     assert steps[-1] == (2, 2)
     assert len(steps) == 2
+
+
+def test_parse_page_selection() -> None:
+    assert parse_page_selection("2, 3, 5-7, 1", 7) == [1, 2, 4, 5, 6, 0]
+
+
+@pytest.mark.parametrize(
+    "selection", ["", "1,", "a", "1--2", "0", "3-2", "1-4"]
+)
+def test_invalid_page_selection_raises(selection: str) -> None:
+    with pytest.raises(ConversionError):
+        parse_page_selection(selection, 3)
+
+
+def test_convert_selected_pages(tmp_path: Path, tiny_pdf: Path) -> None:
+    import zipfile
+
+    selected_steps: list[tuple[int, int]] = []
+    selected = convert(
+        tiny_pdf,
+        tmp_path / "selected.epub",
+        pages="2",
+        progress=lambda done, total: selected_steps.append((done, total)),
+    )
+    full = convert(tiny_pdf, tmp_path / "full.epub")
+
+    with zipfile.ZipFile(selected) as selected_zip, zipfile.ZipFile(full) as full_zip:
+        assert "OEBPS/images/page-0002.png" not in selected_zip.namelist()
+        assert (
+            selected_zip.read("OEBPS/images/page-0001.png")
+            == full_zip.read("OEBPS/images/page-0002.png")
+        )
+        assert (
+            selected_zip.read("OEBPS/images/cover.png")
+            == selected_zip.read("OEBPS/images/page-0001.png")
+        )
+    assert selected_steps == [(1, 1)]
 
 
 def test_slugify() -> None:
@@ -630,14 +1004,39 @@ def test_cli_parser_crop_flags() -> None:
     assert args.nocover is False
     assert args.epub2 is False
     assert args.transparent_background is False
-    assert args.image_format == "png"
+    assert args.image_format is None
     assert args.quality == 85
+    assert args.mrc is False
+    assert args.mrc_extract is False
+    assert args.pages is None
     args = p.parse_args(["in.pdf", "--nocover"])
     assert args.nocover is True
     args = p.parse_args(["in.pdf", "--epub2"])
     assert args.epub2 is True
     args = p.parse_args(["in.pdf", "--transparent-background"])
     assert args.transparent_background is True
+    args = p.parse_args(["in.pdf", "--mrc-extract"])
+    assert args.mrc_extract is True
+    args = p.parse_args(["in.pdf", "--mrc"])
+    assert args.mrc is True
+    args = p.parse_args(["in.pdf", "--pages", "2,3,5-10,21"])
+    assert args.pages == "2,3,5-10,21"
+
+
+def test_cli_preserves_unspecified_image_format(monkeypatch, tmp_path: Path) -> None:
+    import epub_pdf_wrap.__main__ as cli
+
+    formats: list[str] = []
+
+    def fake_convert(*args, **kwargs):
+        formats.append(kwargs["image_format"])
+        return tmp_path / "unused.epub"
+
+    monkeypatch.setattr(cli, "convert", fake_convert)
+    assert cli.main(["in.pdf"]) == 0
+    assert cli.main(["in.pdf", "--mrc-extract"]) == 0
+    assert cli.main(["in.pdf", "--mrc-extract", "--image-format", "png"]) == 0
+    assert formats == [None, None, "png"]
 
 
 def test_cli_parser_image_options() -> None:
