@@ -47,9 +47,13 @@ replaced by the `epub` extension. Running without `pip install` also works via
 - `--quality <1-100>`: JPEG quality used by `jpeg` and `auto` (default: `85`).
 - `--mrc`: generate Mixed Raster Content for every rendered page. The render
   is separated into background and foreground color layers with a lossless
-  1-bit selector. PNG layers reconstruct the render exactly; JPEG or `auto`
-  can reduce file size at the requested quality. This can be combined with
-  `--mrc-extract` to generate MRC for pages that cannot be extracted safely.
+  full-resolution 1-bit selector. This can be combined with `--mrc-extract`
+  to generate MRC for pages that cannot be extracted safely.
+- `--mrc-color-scale <factor>`: downsample generated MRC background and
+  foreground color planes by this integer factor while retaining the sharp
+  full-resolution selector (default: `4`). Larger factors are faster and
+  smaller but retain less color detail. Use `1` for full-resolution planes;
+  with PNG this reconstructs the normal render exactly.
 - `--mrc-extract`: extract compatible existing Mixed Raster Content (MRC)
   pages as source-preserving layered EPUB pages. Native image dimensions,
   compatible compressed bytes, selector depth, page geometry, and invisible
@@ -107,6 +111,8 @@ format separately for each page:
 epub-pdf-wrap scan.pdf --image-format jpeg --quality 85
 epub-pdf-wrap mixed.pdf --image-format auto --quality 85
 epub-pdf-wrap paper.pdf --mrc --image-format auto
+epub-pdf-wrap color-paper.pdf --mrc --mrc-color-scale 2 --image-format auto
+epub-pdf-wrap lossless.pdf --mrc --mrc-color-scale 1
 epub-pdf-wrap mrc-scan.pdf --mrc-extract
 epub-pdf-wrap mixed-mrc.pdf --mrc-extract --mrc --image-format auto
 epub-pdf-wrap mrc-scan.pdf --mrc-extract --image-format jpeg --quality 85
@@ -117,10 +123,14 @@ JPEG cannot preserve transparency. Use PNG or auto with
 Generated MRC is opaque and therefore cannot be combined with
 `--transparent-background`. It uses Otsu luminance segmentation, which is
 well suited to dark text or line art on light paper and remains deterministic
-for photographs and other page content. Pixels outside each color class are
-replaced by that class's average color to improve compression. The selector
-chooses the original pixel from one of the two layers, so the default PNG
-output is lossless relative to the normal page render.
+for photographs and other page content. Pillow performs luminance conversion,
+histogramming, mask creation, downsampling and diffusion using native image
+operations. Pixels outside each color class are filled by expanding nearby
+visible colors and smoothing the synthesized area at color-plane resolution.
+This avoids encoding a sharp copy of the selector silhouette in each color
+image and reduces compression artifacts at its edges. The default 1/4-size
+color planes intentionally trade fine color detail for size and speed; use
+`--mrc-color-scale 1` when pixel-exact PNG reconstruction is required.
 
 In EPUB 3, layered MRC pages use an SVG wrapper and keep the selector as a
 separate lossless mask. Extracted MRC uses PDF page coordinates; each image

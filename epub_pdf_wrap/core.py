@@ -15,10 +15,12 @@ from xml.sax.saxutils import escape
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 
 import pymupdf
+from PIL import Image, ImageFilter, ImageOps, ImageStat
 
 
 IMAGE_FORMATS = ("png", "jpeg", "auto")
 DEFAULT_JPEG_QUALITY = 85
+DEFAULT_MRC_COLOR_SCALE = 4
 ImageData = tuple[str, bytes]
 PageLayers = tuple[ImageData, ...]
 OcrWord = tuple[float, float, float, float, str]
@@ -38,6 +40,12 @@ class PageContent:
 _AUTO_PNG_SIZE_RATIO = 1.10
 
 _PNG_GRAYSCALE_DEPTHS = (1, 2, 4, 8)
+
+# Hidden MRC pixels are blurred after the visible pixels have been expanded
+# into them. A small radius removes mask-shaped edges without making the
+# synthesis unnecessarily expensive on large rendered pages.
+_MRC_HIDDEN_BLUR_RADIUS = 2
+_MRC_DIFFUSION_PASSES = 2
 
 # JPEG 2000 sources are typically compressed far more aggressively than a
 # generic JPEG quality would choose by default (MRC layers are meant to be
@@ -242,6 +250,14 @@ def _validate_image_options(image_format: str, quality: int) -> tuple[str, int]:
     ):
         raise ConversionError(f"quality must be an integer from 1 to 100, got {quality!r}")
     return image_format, quality
+
+
+def _validate_mrc_color_scale(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ConversionError(
+            f"mrc_color_scale must be a positive integer, got {value!r}"
+        )
+    return value
 
 
 def _jpeg_at_target_size(
@@ -473,18 +489,65 @@ def _otsu_threshold(histogram: list[int], pixel_count: int) -> int:
     return best_threshold
 
 
+def _expanded_mrc_layer(
+    source: Image.Image,
+    mask: Image.Image,
+    size: tuple[int, int],
+    empty_fill: tuple[int, int, int],
+) -> Image.Image:
+    """Expand and smooth one MRC class using Pillow's native operations.
+
+    Masked native downsampling produces the requested color-plane resolution.
+    Repeated native blur-and-paste passes diffuse visible colors through the
+    class mean. At full resolution, the final paste restores visible pixels
+    verbatim; at lower resolutions it restores their area-weighted proxy.
+    """
+    if mask.getbbox() is None:
+        return Image.new("RGB", size, empty_fill)
+
+    mean = tuple(round(value) for value in ImageStat.Stat(source, mask).mean)
+    visible = Image.new("RGBA", source.size)
+    visible.paste(source, (0, 0), mask)
+    if visible.size != size:
+        visible = visible.resize(size, Image.Resampling.BOX)
+
+    visible_rgb = visible.convert("RGB")
+    visible_mask = visible.getchannel("A")
+    expanded = Image.new("RGB", size, mean)
+    expanded.paste(visible_rgb, (0, 0), visible_mask)
+    blur = ImageFilter.BoxBlur(_MRC_HIDDEN_BLUR_RADIUS)
+    for _ in range(_MRC_DIFFUSION_PASSES):
+        expanded = expanded.filter(blur)
+        expanded.paste(visible_rgb, (0, 0), visible_mask)
+    return expanded
+
+
+def _pillow_rgb_image(pixmap: "pymupdf.Pixmap") -> Image.Image:
+    """Expose an opaque RGB Pixmap as a Pillow image, respecting its stride."""
+    return Image.frombytes(
+        "RGB",
+        (pixmap.width, pixmap.height),
+        pixmap.samples,
+        "raw",
+        "RGB",
+        pixmap.stride,
+        1,
+    )
+
+
 def _split_mrc_pixmap(
     pixmap: "pymupdf.Pixmap",
+    color_scale: int = DEFAULT_MRC_COLOR_SCALE,
 ) -> tuple["pymupdf.Pixmap", "pymupdf.Pixmap", "pymupdf.Pixmap"]:
     """Split an opaque RGB render into background, foreground and selector.
 
     Otsu luminance segmentation is intentionally global and deterministic: it
     handles the common dark-text/light-paper scan without adding another image
     processing dependency, while remaining valid for every opaque rendered
-    page. Pixels unused by a color layer are replaced by that class's average
-    color, which makes the layer substantially more compressible. With PNG
-    layers, selecting foreground/background pixels reconstructs the render
-    exactly; JPEG layers trade fidelity for size according to *quality*.
+    page. Each color class is expanded and blurred through the other class's
+    hidden pixels, removing the selector-shaped edge that would otherwise be
+    expensive to compress. Scale 1 PNG color planes reconstruct the render
+    exactly; downsampled planes and JPEG trade fidelity for size and speed.
     """
     if (
         pixmap.colorspace is None
@@ -492,81 +555,34 @@ def _split_mrc_pixmap(
         or pixmap.alpha
     ):
         raise ConversionError("generated MRC requires an opaque RGB page render")
+    color_scale = _validate_mrc_color_scale(color_scale)
 
     width, height = pixmap.width, pixmap.height
-    pixel_count = width * height
-    samples = pixmap.samples
-    histogram = [0] * 256
-    luminances = bytearray(pixel_count)
-    position = 0
-    for y in range(height):
-        row = y * pixmap.stride
-        for x in range(width):
-            source = row + x * 3
-            luminance = (
-                77 * samples[source]
-                + 150 * samples[source + 1]
-                + 29 * samples[source + 2]
-                + 128
-            ) >> 8
-            luminances[position] = luminance
-            histogram[luminance] += 1
-            position += 1
-
-    threshold = _otsu_threshold(histogram, pixel_count)
-    mask_samples = bytearray(pixel_count)
-    foreground_sum = [0, 0, 0]
-    background_sum = [0, 0, 0]
-    foreground_count = 0
-    background_count = 0
-    position = 0
-    for y in range(height):
-        row = y * pixmap.stride
-        for x in range(width):
-            source = row + x * 3
-            is_foreground = luminances[position] <= threshold
-            target_sum = foreground_sum if is_foreground else background_sum
-            if is_foreground:
-                mask_samples[position] = 255
-                foreground_count += 1
-            else:
-                background_count += 1
-            target_sum[0] += samples[source]
-            target_sum[1] += samples[source + 1]
-            target_sum[2] += samples[source + 2]
-            position += 1
-
-    foreground_fill = tuple(
-        round(value / foreground_count) if foreground_count else 0
-        for value in foreground_sum
+    source = _pillow_rgb_image(pixmap)
+    grayscale = source.convert("L")
+    threshold = _otsu_threshold(grayscale.histogram(), width * height)
+    selector_image = grayscale.point(
+        [255 if value <= threshold else 0 for value in range(256)], "L"
     )
-    background_fill = tuple(
-        round(value / background_count) if background_count else 255
-        for value in background_sum
+    plane_size = (
+        max(1, (width + color_scale - 1) // color_scale),
+        max(1, (height + color_scale - 1) // color_scale),
     )
-    foreground_samples = bytearray(foreground_fill * pixel_count)
-    background_samples = bytearray(background_fill * pixel_count)
-
-    position = 0
-    for y in range(height):
-        row = y * pixmap.stride
-        for x in range(width):
-            source = row + x * 3
-            target = position * 3
-            if mask_samples[position]:
-                foreground_samples[target:target + 3] = samples[source:source + 3]
-            else:
-                background_samples[target:target + 3] = samples[source:source + 3]
-            position += 1
+    foreground_image = _expanded_mrc_layer(
+        source, selector_image, plane_size, (0, 0, 0)
+    )
+    background_image = _expanded_mrc_layer(
+        source, ImageOps.invert(selector_image), plane_size, (255, 255, 255)
+    )
 
     background = pymupdf.Pixmap(
-        pymupdf.csRGB, width, height, bytes(background_samples), False
+        pymupdf.csRGB, plane_size[0], plane_size[1], background_image.tobytes(), False
     )
     foreground = pymupdf.Pixmap(
-        pymupdf.csRGB, width, height, bytes(foreground_samples), False
+        pymupdf.csRGB, plane_size[0], plane_size[1], foreground_image.tobytes(), False
     )
     selector = pymupdf.Pixmap(
-        pymupdf.csGRAY, width, height, bytes(mask_samples), False
+        pymupdf.csGRAY, width, height, selector_image.tobytes(), False
     )
     return background, foreground, selector
 
@@ -576,9 +592,10 @@ def _rendered_mrc_page(
     image_format: str,
     quality: int,
     svg_mask: bool = True,
+    color_scale: int = DEFAULT_MRC_COLOR_SCALE,
 ) -> PageContent:
     """Encode one rendered Pixmap as a two-color-layer MRC page."""
-    background, foreground, selector = _split_mrc_pixmap(pixmap)
+    background, foreground, selector = _split_mrc_pixmap(pixmap, color_scale)
     background_data = _encode_pixmap(background, image_format, quality)
     background_extension = _image_info("", background_data)[0]
 
@@ -597,8 +614,20 @@ def _rendered_mrc_page(
 
     # EPUB 2 cannot apply a separate SVG mask reliably. Store the foreground
     # as a transparent PNG overlay, matching extracted MRC compatibility mode.
-    foreground_alpha = pymupdf.Pixmap(foreground, selector)
-    foreground_alpha.set_alpha(selector.samples, premultiply=1)
+    overlay_selector = selector
+    if (selector.width, selector.height) != (foreground.width, foreground.height):
+        selector_image = Image.frombytes(
+            "L", (selector.width, selector.height), selector.samples
+        ).resize((foreground.width, foreground.height), Image.Resampling.BOX)
+        overlay_selector = pymupdf.Pixmap(
+            pymupdf.csGRAY,
+            foreground.width,
+            foreground.height,
+            selector_image.tobytes(),
+            False,
+        )
+    foreground_alpha = pymupdf.Pixmap(foreground, overlay_selector)
+    foreground_alpha.set_alpha(overlay_selector.samples, premultiply=1)
     foreground_data = foreground_alpha.tobytes("png")
     return PageContent(
         (
@@ -1329,7 +1358,8 @@ def convert(input_path: Path, output_path: Path | None = None,
             quality: int = DEFAULT_JPEG_QUALITY,
             mrc_extract: bool = False,
             pages: str | None = None,
-            mrc: bool = False) -> Path:
+            mrc: bool = False,
+            mrc_color_scale: int = DEFAULT_MRC_COLOR_SCALE) -> Path:
     """Convert *input_path* (a PDF) to an EPUB and return the output path.
 
     Every PDF page is rendered to an image and placed in its own EPUB section
@@ -1359,6 +1389,8 @@ def convert(input_path: Path, output_path: Path | None = None,
     When *mrc* is true, every normally rendered page is split into background
     and foreground color layers selected by a lossless 1-bit mask. This also
     applies to pages where *mrc_extract* cannot safely reuse source layers.
+    *mrc_color_scale* downsamples those color layers by that integer factor;
+    the selector remains at full resolution. Use 1 for full-resolution planes.
     When *mrc_extract* is true, canonical two-layer MRC pages are extracted
     into background and foreground images selected by a lossless mask. Pages
     that do not match the safe extraction pattern use the normal renderer.
@@ -1374,6 +1406,7 @@ def convert(input_path: Path, output_path: Path | None = None,
     effective_image_format, quality = _validate_image_options(
         image_format or "png", quality
     )
+    mrc_color_scale = _validate_mrc_color_scale(mrc_color_scale)
     if transparent_background and effective_image_format == "jpeg":
         raise ConversionError("JPEG does not support a transparent background")
     if mrc and transparent_background:
@@ -1453,6 +1486,7 @@ def convert(input_path: Path, output_path: Path | None = None,
                 _log("mrc:     extraction skipped with crop, margins, or transparency")
         if mrc:
             _log("mrc:     generation enabled for rendered pages")
+            _log(f"mrc:     color-plane scale 1/{mrc_color_scale}")
         if any(margins):
             _log(f"margins: {margins[0]} {margins[1]} {margins[2]} {margins[3]} px")
         if crop is not None:
@@ -1502,6 +1536,7 @@ def convert(input_path: Path, output_path: Path | None = None,
                 generated_page = _rendered_mrc_page(
                     pixmap, effective_image_format, quality,
                     svg_mask=not epub2,
+                    color_scale=mrc_color_scale,
                 )
                 layers = tuple(
                     (f"page-{i + 1:04d}-{name}", data)

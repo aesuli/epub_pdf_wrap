@@ -9,6 +9,7 @@ from epub_pdf_wrap.core import (
     ConversionError,
     _encode_grayscale_png,
     _encode_pixmap,
+    _split_mrc_pixmap,
     convert,
     format_size,
     parse_page_selection,
@@ -587,6 +588,7 @@ def test_mrc_generates_layers_for_rendered_page_and_reconstructs_png(
         tmp_path / "rendered-mrc.epub",
         resolution=40,
         mrc=True,
+        mrc_color_scale=1,
         cover=False,
         log=logs.append,
     )
@@ -619,6 +621,49 @@ def test_mrc_generates_layers_for_rendered_page_and_reconstructs_png(
     assert "mrc:     generated 1 of 1 pages" in logs
 
 
+def test_mrc_hidden_pixels_are_expanded_and_smoothed() -> None:
+    width, height = 11, 5
+    samples = bytearray()
+    for y in range(height):
+        for x in range(width):
+            color = (190 + x * 4, 205 + y * 3, 225 - x * 2)
+            if y == 2 and x == 2:
+                color = (8, 18, 28)
+            elif y == 2 and x == 8:
+                color = (72, 12, 22)
+            samples.extend(color)
+    source = pymupdf.Pixmap(
+        pymupdf.csRGB, width, height, bytes(samples), False
+    )
+
+    background, foreground, selector = _split_mrc_pixmap(source, color_scale=1)
+    mask = selector.samples
+
+    assert sum(value == 255 for value in mask) == 2
+    foreground_hidden = {
+        foreground.samples[position * 3:position * 3 + 3]
+        for position, selected in enumerate(mask)
+        if not selected
+    }
+    background_hidden = [
+        background.samples[position * 3:position * 3 + 3]
+        for position, selected in enumerate(mask)
+        if selected
+    ]
+
+    # A flat fill produces one repeated hidden color and preserves the mask's
+    # silhouette as a hard edge. Expansion plus blur produces a smooth field
+    # derived from nearby visible pixels on both layers.
+    assert len(foreground_hidden) > 2
+    assert background_hidden[0] != background_hidden[1]
+
+    # Synthesis may only touch pixels hidden by the selector.
+    for position, selected in enumerate(mask):
+        start = position * 3
+        visible = foreground.samples if selected else background.samples
+        assert visible[start:start + 3] == source.samples[start:start + 3]
+
+
 def test_mrc_epub2_uses_transparent_foreground_overlay(
     tmp_path: Path, tiny_pdf: Path
 ) -> None:
@@ -643,6 +688,36 @@ def test_mrc_epub2_uses_transparent_foreground_overlay(
     assert foreground[25] == 6  # RGBA PNG
     assert xhtml.count("<img ") == 2
     assert "<svg " not in xhtml
+
+
+def test_mrc_default_uses_low_resolution_color_planes(
+    tmp_path: Path, tiny_pdf: Path
+) -> None:
+    import zipfile
+
+    out = convert(
+        tiny_pdf,
+        tmp_path / "scaled-mrc.epub",
+        resolution=80,
+        mrc=True,
+        cover=False,
+    )
+    with zipfile.ZipFile(out) as z:
+        background = pymupdf.Pixmap(
+            z.read("OEBPS/images/page-0001-background.png")
+        )
+        foreground = pymupdf.Pixmap(
+            z.read("OEBPS/images/page-0001-foreground.png")
+        )
+        selector = pymupdf.Pixmap(
+            z.read("OEBPS/images/page-0001-mask.png")
+        )
+        xhtml = z.read("OEBPS/page-0001.xhtml").decode("utf-8")
+
+    assert (background.width, background.height) == (20, 26)
+    assert (foreground.width, foreground.height) == (20, 26)
+    assert (selector.width, selector.height) == (80, 104)
+    assert '<meta name="viewport" content="width=80, height=104"/>' in xhtml
 
 
 def test_mrc_and_extract_generate_fallback_pages(
@@ -671,6 +746,12 @@ def test_mrc_and_extract_generate_fallback_pages(
 def test_mrc_rejects_transparent_background(tiny_pdf: Path) -> None:
     with pytest.raises(ConversionError, match="transparent"):
         convert(tiny_pdf, mrc=True, transparent_background=True)
+
+
+@pytest.mark.parametrize("scale", [0, -1, 1.5, True])
+def test_mrc_rejects_invalid_color_scale(tiny_pdf: Path, scale) -> None:
+    with pytest.raises(ConversionError, match="mrc_color_scale"):
+        convert(tiny_pdf, mrc=True, mrc_color_scale=scale)
 
 
 def test_margins_add_exact_output_pixels(tmp_path: Path, tiny_pdf: Path) -> None:
@@ -1007,6 +1088,7 @@ def test_cli_parser_crop_flags() -> None:
     assert args.image_format is None
     assert args.quality == 85
     assert args.mrc is False
+    assert args.mrc_color_scale == 4
     assert args.mrc_extract is False
     assert args.pages is None
     args = p.parse_args(["in.pdf", "--nocover"])
@@ -1019,6 +1101,11 @@ def test_cli_parser_crop_flags() -> None:
     assert args.mrc_extract is True
     args = p.parse_args(["in.pdf", "--mrc"])
     assert args.mrc is True
+    args = p.parse_args(["in.pdf", "--mrc", "--mrc-color-scale", "2"])
+    assert args.mrc_color_scale == 2
+    with pytest.raises(SystemExit) as exc:
+        p.parse_args(["in.pdf", "--mrc-color-scale", "0"])
+    assert exc.value.code == 2
     args = p.parse_args(["in.pdf", "--pages", "2,3,5-10,21"])
     assert args.pages == "2,3,5-10,21"
 

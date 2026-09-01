@@ -6,7 +6,13 @@ import argparse
 import sys
 
 from . import __version__
-from .core import DEFAULT_JPEG_QUALITY, IMAGE_FORMATS, ConversionError, convert
+from .core import (
+    DEFAULT_JPEG_QUALITY,
+    DEFAULT_MRC_COLOR_SCALE,
+    IMAGE_FORMATS,
+    ConversionError,
+    convert,
+)
 
 
 def _non_negative_int(value: str) -> int:
@@ -20,6 +26,13 @@ def _jpeg_quality(value: str) -> int:
     number = int(value)
     if not 1 <= number <= 100:
         raise argparse.ArgumentTypeError("must be an integer from 1 to 100")
+    return number
+
+
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be an integer greater than 0")
     return number
 
 
@@ -76,6 +89,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "split every rendered page into Mixed Raster Content background, "
             "foreground and selector layers"
+        ),
+    )
+    parser.add_argument(
+        "--mrc-color-scale", type=_positive_int,
+        default=DEFAULT_MRC_COLOR_SCALE, metavar="FACTOR",
+        help=(
+            "downsample generated MRC color planes by this factor while "
+            f"keeping the mask full-size (default: {DEFAULT_MRC_COLOR_SCALE}; "
+            "use 1 for full resolution)"
         ),
     )
     parser.add_argument(
@@ -149,6 +171,7 @@ def main(argv: list[str] | None = None) -> int:
             image_format=args.image_format,
             quality=args.quality,
             mrc=args.mrc,
+            mrc_color_scale=args.mrc_color_scale,
             mrc_extract=args.mrc_extract,
             pages=args.pages,
             log=lambda line: print(line),
