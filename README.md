@@ -36,6 +36,8 @@ replaced by the `epub` extension. Running without `pip install` also works via
   in the output file. By default normal pages are rendered at the size the PDF
   declares, while `--mrc-extract` retains each source image's native pixels.
   Supplying `-r` explicitly authorizes resampling extracted MRC resources.
+- `--title <text>`: override the EPUB title extracted from the PDF.
+- `--author <text>`: override the EPUB author extracted from the PDF.
 - `--pages <selection>`: include only the selected PDF pages. Use 1-based page
   numbers and inclusive ranges separated by commas, such as
   `--pages 2,3,5-10,21`. Pages are included in the requested order.

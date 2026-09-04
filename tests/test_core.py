@@ -1082,6 +1082,8 @@ def test_cli_parser_crop_flags() -> None:
         p.parse_args(["in.pdf", "-c", "--crop-page"])
     assert exc.value.code == 2
     args = p.parse_args(["in.pdf"])
+    assert args.title is None
+    assert args.author is None
     assert args.nocover is False
     assert args.epub2 is False
     assert args.transparent_background is False
@@ -1108,6 +1110,9 @@ def test_cli_parser_crop_flags() -> None:
     assert exc.value.code == 2
     args = p.parse_args(["in.pdf", "--pages", "2,3,5-10,21"])
     assert args.pages == "2,3,5-10,21"
+    args = p.parse_args(["in.pdf", "--title", "Override", "--author", "New Author"])
+    assert args.title == "Override"
+    assert args.author == "New Author"
 
 
 def test_cli_preserves_unspecified_image_format(monkeypatch, tmp_path: Path) -> None:
@@ -1124,6 +1129,20 @@ def test_cli_preserves_unspecified_image_format(monkeypatch, tmp_path: Path) -> 
     assert cli.main(["in.pdf", "--mrc-extract"]) == 0
     assert cli.main(["in.pdf", "--mrc-extract", "--image-format", "png"]) == 0
     assert formats == [None, None, "png"]
+
+
+def test_cli_forwards_metadata_overrides(monkeypatch, tmp_path: Path) -> None:
+    import epub_pdf_wrap.__main__ as cli
+
+    metadata = []
+
+    def fake_convert(*args, **kwargs):
+        metadata.append((kwargs["title"], kwargs["author"]))
+        return tmp_path / "unused.epub"
+
+    monkeypatch.setattr(cli, "convert", fake_convert)
+    assert cli.main(["in.pdf", "--title", "New Title", "--author", "New Author"]) == 0
+    assert metadata == [("New Title", "New Author")]
 
 
 def test_cli_parser_image_options() -> None:
@@ -1228,3 +1247,20 @@ def test_metadata_fallback_title_when_empty(tmp_path: Path) -> None:
     assert "<dc:subject>" not in opf
     assert "<dc:date>" not in opf
     blank.unlink()
+
+
+def test_metadata_overrides_are_independent(
+    tmp_path: Path, metadata_pdf: Path
+) -> None:
+    from ebooklib import epub
+
+    title_out = convert(metadata_pdf, tmp_path / "title.epub", title="New Title")
+    author_out = convert(metadata_pdf, tmp_path / "author.epub", author="New Author")
+
+    title_book = epub.read_epub(str(title_out), options={"ignore_ncx": True})
+    assert title_book.get_metadata("DC", "title")[0][0] == "New Title"
+    assert title_book.get_metadata("DC", "creator")[0][0] == "Jane Doe, John Roe"
+
+    author_book = epub.read_epub(str(author_out), options={"ignore_ncx": True})
+    assert author_book.get_metadata("DC", "title")[0][0] == "A <Great> Book & Co"
+    assert author_book.get_metadata("DC", "creator")[0][0] == "New Author"

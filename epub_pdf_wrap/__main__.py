@@ -55,6 +55,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="output EPUB file (default: input filename with .epub extension)",
     )
     parser.add_argument(
+        "--title",
+        help="override the EPUB title extracted from the PDF",
+    )
+    parser.add_argument(
+        "--author",
+        help="override the EPUB author extracted from the PDF",
+    )
+    parser.add_argument(
         "-r", "--resolution", type=int,
         help=(
             "target output width in pixels; explicitly resamples extracted "
@@ -174,6 +182,8 @@ def main(argv: list[str] | None = None) -> int:
             mrc_color_scale=args.mrc_color_scale,
             mrc_extract=args.mrc_extract,
             pages=args.pages,
+            title=args.title,
+            author=args.author,
             log=lambda line: print(line),
             progress=_progress,
         )

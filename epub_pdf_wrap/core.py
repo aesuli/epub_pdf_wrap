@@ -1359,7 +1359,9 @@ def convert(input_path: Path, output_path: Path | None = None,
             mrc_extract: bool = False,
             pages: str | None = None,
             mrc: bool = False,
-            mrc_color_scale: int = DEFAULT_MRC_COLOR_SCALE) -> Path:
+            mrc_color_scale: int = DEFAULT_MRC_COLOR_SCALE,
+            title: str | None = None,
+            author: str | None = None) -> Path:
     """Convert *input_path* (a PDF) to an EPUB and return the output path.
 
     Every PDF page is rendered to an image and placed in its own EPUB section
@@ -1394,6 +1396,9 @@ def convert(input_path: Path, output_path: Path | None = None,
     When *mrc_extract* is true, canonical two-layer MRC pages are extracted
     into background and foreground images selected by a lossless mask. Pages
     that do not match the safe extraction pattern use the normal renderer.
+
+    When *title* or *author* is given, it overrides the corresponding PDF
+    metadata field independently. *author* is written as the EPUB creator.
 
     *log* (optional callable(str)) receives descriptive lines (input info,
     output result). *progress* (optional callable(done, total)) is called for
@@ -1448,6 +1453,10 @@ def convert(input_path: Path, output_path: Path | None = None,
         page_count = len(page_indices)
         metadata = epub_metadata(doc)
         metadata.setdefault("title", slugify(input_path.stem))
+        if title is not None:
+            metadata["title"] = title
+        if author is not None:
+            metadata["creator"] = author
         pages_list = [doc.load_page(i) for i in page_indices]
 
         first = pages_list[0]
