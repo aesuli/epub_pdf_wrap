@@ -46,6 +46,20 @@ def test_convert_produces_epub(tmp_path: Path, tiny_pdf: Path) -> None:
         assert "OEBPS/images/page-0002.png" in names
 
 
+def test_parallel_conversion_preserves_page_order(
+    tmp_path: Path, tiny_pdf: Path
+) -> None:
+    import zipfile
+
+    out = convert(tiny_pdf, tmp_path / "parallel.epub", parallel=2)
+    with zipfile.ZipFile(out) as z:
+        names = z.namelist()
+        assert names.index("OEBPS/page-0001.xhtml") < names.index("OEBPS/page-0002.xhtml")
+        assert names.index("OEBPS/images/page-0001.png") < names.index(
+            "OEBPS/images/page-0002.png"
+        )
+
+
 def test_page_xhtml_body_contains_only_the_page_image(
     tmp_path: Path, tiny_pdf: Path
 ) -> None:

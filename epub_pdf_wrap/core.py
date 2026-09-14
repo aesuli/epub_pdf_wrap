@@ -7,6 +7,7 @@ import struct
 import time
 import uuid
 import zlib
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import BytesIO
@@ -1348,6 +1349,58 @@ def format_size(num_bytes: int) -> str:
         size /= 1024
 
 
+def _convert_page_worker(args):
+    (
+        input_path, source_index, output_index, resolution, clip_values, margins,
+        effective_image_format, requested_image_format, quality,
+        transparent_background, mrc_extract, mrc, mrc_color_scale, epub2,
+    ) = args
+    doc = pymupdf.open(str(input_path))
+    try:
+        page = doc.load_page(source_index)
+        clip = pymupdf.Rect(*clip_values) if clip_values is not None else None
+        extracted_page = (
+            _mrc_page_layers(
+                page, doc, resolution, requested_image_format,
+                quality, svg_mask=not epub2,
+            )
+            if mrc_extract else None
+        )
+        if extracted_page is not None:
+            layers = tuple(
+                (f"page-{output_index + 1:04d}-{name}", data)
+                for name, data in extracted_page.layers
+            )
+            return PageContent(layers, extracted_page.viewport, extracted_page.ocr_words), True, False, None
+        if mrc:
+            pixmap = _render_page_pixmap(page, resolution, clip, False, margins)
+            generated_page = _rendered_mrc_page(
+                pixmap, effective_image_format, quality,
+                svg_mask=not epub2,
+                color_scale=mrc_color_scale,
+            )
+            layers = tuple(
+                (f"page-{output_index + 1:04d}-{name}", data)
+                for name, data in generated_page.layers
+            )
+            cover_data = (
+                _encode_pixmap(pixmap, effective_image_format, quality)
+                if output_index == 0 else None
+            )
+            return PageContent(layers, generated_page.viewport), False, True, cover_data
+        data = render_page(
+            page, resolution, clip,
+            transparent_background=transparent_background,
+            margins=margins,
+            image_format=effective_image_format,
+            quality=quality,
+        )
+        extension = _image_info("", data)[0]
+        return PageContent(((f"page-{output_index + 1:04d}.{extension}", data),)), False, False, None
+    finally:
+        doc.close()
+
+
 def convert(input_path: Path, output_path: Path | None = None,
             resolution: int | None = None, crop: str | None = None,
             cover: bool = True, log=None, progress=None,
@@ -1356,6 +1409,7 @@ def convert(input_path: Path, output_path: Path | None = None,
             margins: "tuple[int, int, int, int] | None" = None,
             image_format: str | None = None,
             quality: int = DEFAULT_JPEG_QUALITY,
+            parallel: int = 1,
             mrc_extract: bool = False,
             pages: str | None = None,
             mrc: bool = False,
@@ -1406,6 +1460,8 @@ def convert(input_path: Path, output_path: Path | None = None,
     """
     if crop is not None and crop not in ("global", "page"):
         raise ConversionError(f"crop must be 'global' or 'page', got {crop!r}")
+    if isinstance(parallel, bool) or not isinstance(parallel, int) or parallel <= 0:
+        raise ConversionError(f"parallel must be a positive integer, got {parallel!r}")
     margins = _validate_margins(margins)
     requested_image_format = image_format
     effective_image_format, quality = _validate_image_options(
@@ -1514,66 +1570,77 @@ def convert(input_path: Path, output_path: Path | None = None,
             and not any(margins)
             and not transparent_background
         )
-        for i, (page, clip_raw) in enumerate(zip(pages_list, clips)):
-            clip = None if (clip_raw is None or clip_raw == page.rect) else clip_raw
-            extracted_page = (
-                _mrc_page_layers(
-                    page, doc, resolution, requested_image_format, quality,
-                    svg_mask=not epub2,
-                )
-                if extraction_allowed else None
+        worker_args = [
+            (
+                input_path, source_index, i, resolution,
+                None if clip_raw is None or clip_raw == page.rect
+                else (clip_raw.x0, clip_raw.y0, clip_raw.x1, clip_raw.y1),
+                margins, effective_image_format, requested_image_format, quality,
+                transparent_background, extraction_allowed, mrc,
+                mrc_color_scale, epub2,
             )
-            if extracted_page is not None:
-                layers = tuple(
-                    (f"page-{i + 1:04d}-{name}", data)
-                    for name, data in extracted_page.layers
-                )
-                rendered.append(
-                    PageContent(
-                        layers,
-                        extracted_page.viewport,
-                        extracted_page.ocr_words,
+            for i, (source_index, page, clip_raw)
+            in enumerate(zip(page_indices, pages_list, clips))
+        ]
+        if parallel > 1:
+            with ProcessPoolExecutor(max_workers=parallel) as executor:
+                page_results = executor.map(_convert_page_worker, worker_args)
+                for i, (page_content, was_extracted, was_generated, cover_data) in enumerate(page_results):
+                    rendered.append(page_content)
+                    extracted_count += was_extracted
+                    generated_count += was_generated
+                    if cover and cover_data is not None:
+                        cover_image_for_layers = cover_data
+                    _progress(i + 1, page_count)
+        else:
+            for i, (page, clip_raw) in enumerate(zip(pages_list, clips)):
+                clip = None if (clip_raw is None or clip_raw == page.rect) else clip_raw
+                extracted_page = (
+                    _mrc_page_layers(
+                        page, doc, resolution, requested_image_format, quality,
+                        svg_mask=not epub2,
                     )
+                    if extraction_allowed else None
                 )
-                extracted_count += 1
+                if extracted_page is not None:
+                    layers = tuple(
+                        (f"page-{i + 1:04d}-{name}", data)
+                        for name, data in extracted_page.layers
+                    )
+                    rendered.append(PageContent(
+                        layers, extracted_page.viewport, extracted_page.ocr_words
+                    ))
+                    extracted_count += 1
+                    _progress(i + 1, page_count)
+                    continue
+                if mrc:
+                    pixmap = _render_page_pixmap(page, resolution, clip, False, margins)
+                    generated_page = _rendered_mrc_page(
+                        pixmap, effective_image_format, quality,
+                        svg_mask=not epub2, color_scale=mrc_color_scale,
+                    )
+                    layers = tuple(
+                        (f"page-{i + 1:04d}-{name}", data)
+                        for name, data in generated_page.layers
+                    )
+                    rendered.append(PageContent(layers, generated_page.viewport))
+                    if cover and i == 0:
+                        cover_image_for_layers = _encode_pixmap(
+                            pixmap, effective_image_format, quality
+                        )
+                    generated_count += 1
+                else:
+                    data = render_page(
+                        page, resolution, clip,
+                        transparent_background=transparent_background,
+                        margins=margins, image_format=effective_image_format,
+                        quality=quality,
+                    )
+                    extension = _image_info("", data)[0]
+                    rendered.append(PageContent(
+                        ((f"page-{i + 1:04d}.{extension}", data),)
+                    ))
                 _progress(i + 1, page_count)
-                continue
-            if mrc:
-                pixmap = _render_page_pixmap(
-                    page, resolution, clip, False, margins
-                )
-                generated_page = _rendered_mrc_page(
-                    pixmap, effective_image_format, quality,
-                    svg_mask=not epub2,
-                    color_scale=mrc_color_scale,
-                )
-                layers = tuple(
-                    (f"page-{i + 1:04d}-{name}", data)
-                    for name, data in generated_page.layers
-                )
-                rendered.append(PageContent(layers, generated_page.viewport))
-                if cover and i == 0:
-                    # Keep the already rendered pixels for the single-image
-                    # cover. Re-rendering would be wasteful and, with native
-                    # resolution plus added margins, could scale the page a
-                    # second time before applying the padding again.
-                    cover_image_for_layers = _encode_pixmap(
-                        pixmap, effective_image_format, quality
-                    )
-                generated_count += 1
-            else:
-                data = render_page(
-                    page, resolution, clip,
-                    transparent_background=transparent_background,
-                    margins=margins,
-                    image_format=effective_image_format,
-                    quality=quality,
-                )
-                extension = _image_info("", data)[0]
-                rendered.append(
-                    PageContent(((f"page-{i + 1:04d}.{extension}", data),))
-                )
-            _progress(i + 1, page_count)
         if effective_image_format == "auto":
             color_images = [
                 name

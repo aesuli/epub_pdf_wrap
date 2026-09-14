@@ -70,6 +70,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--parallel", type=_positive_int, default=1, metavar="NUM",
+        help="convert pages in NUM parallel processes (default: 1)",
+    )
+    parser.add_argument(
         "--pages", metavar="SELECTION",
         help=(
             "pages to include, as numbers and inclusive ranges "
@@ -171,6 +175,7 @@ def main(argv: list[str] | None = None) -> int:
             args.input,
             args.output,
             args.resolution,
+            parallel=args.parallel,
             crop=crop,
             cover=not args.nocover,
             epub2=args.epub2,
