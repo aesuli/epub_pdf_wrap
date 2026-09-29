@@ -5,6 +5,10 @@ This is specifically aimed at PDF files that cannot be converted into EPUB any o
 
 The generated EPUB uses EPUB 3 fixed-layout metadata by default: each PDF page is one pre-paginated spine item.
 
+The software implements [Mixed Raster Content](https://en.wikipedia.org/wiki/Mixed_raster_content) based on [Otsu luminance segmentation](https://en.wikipedia.org/wiki/Otsu%27s_method) to reduce the size of the produced epubs with controllable quality loss.
+
+![MRC example](MRC_example.png)
+
 ## Installation
 
 The package is published on PyPI https://pypi.org/project/epub-pdf-wrap/ and can be installed via pip:
